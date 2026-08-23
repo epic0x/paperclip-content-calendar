@@ -113,133 +113,135 @@ function authHeaderFor(
  * a Paperclip-managed secret. Returns null when any part is missing, so
  * `isConfigured` can report a clean false rather than throwing mid-publish.
  */
-async function resolveXCreds(
-  ctx: PluginContext,
-  cfg: CalendarConfig,
-): Promise<XCreds | null> {
-  const refs = cfg.xCredentials;
-  if (!refs) return null;
-  const need = ["apiKeyRef", "apiSecretRef", "accessTokenRef", "accessSecretRef"] as const;
-  if (need.some((k) => !refs[k])) return null;
+const X_PUBLISH_SCRIPT =
+  process.env.PAPERCLIP_X_PUBLISH_SCRIPT ??
+  `${process.env.HOME ?? ""}/.hermes/scripts/x_publish.py`;
 
-  try {
-    const [apiKey, apiSecret, accessToken, accessSecret] = await Promise.all(
-      need.map((k) =>
-        ctx.secrets.resolve(refs[k] as string, {
-          configPath: `xCredentials.${k}`,
-        }),
-      ),
-    );
-    if (!apiKey || !apiSecret || !accessToken || !accessSecret) return null;
-    return { apiKey, apiSecret, accessToken, accessSecret };
-  } catch (err) {
-    ctx.logger.warn(
-      `[content-calendar] could not resolve X credentials: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return null;
-  }
-}
+const MEDIA_DIR =
+  process.env.PAPERCLIP_MEDIA_DIR ?? `${process.env.HOME ?? ""}/social/out`;
 
-const X_TWEETS_URL = "https://api.x.com/2/tweets";
-/** X hard-limits a standard post. Fail before the API does, with a clear reason. */
-const X_MAX_CHARS = 280;
-
+/**
+ * X adapter.
+ *
+ * Delegates to the host publish script instead of reimplementing X here. That
+ * script owns the OAuth1 credentials and the v1.1 multipart media upload — X's
+ * v2 API has no upload endpoint, so an image must go through v1.1 first to get
+ * a media_id, and signing a multipart OAuth1 request is the single most
+ * error-prone corner of that API. It is already proven end to end.
+ *
+ * The token never enters this process, the plugin config, or the database.
+ * The script emits exactly one JSON object on stdout either way, so the result
+ * is parsed rather than scraped out of log noise.
+ */
 const xAdapter: ChannelAdapter = {
   channel: "x",
 
-  async isConfigured(ctx, cfg) {
-    return (await resolveXCreds(ctx, cfg)) !== null;
+  async isConfigured() {
+    const { existsSync } = await import("node:fs");
+    return existsSync(X_PUBLISH_SCRIPT);
   },
 
-  async publish(ctx, cfg, req) {
-    const creds = await resolveXCreds(ctx, cfg);
-    if (!creds) {
+  async publish(_ctx, _cfg, req): Promise<PublishResult> {
+    const { spawn } = await import("node:child_process");
+    const { existsSync } = await import("node:fs");
+
+    const caption = req.caption?.trim();
+    if (!caption) {
+      return { ok: false, url: null, error: "case has no caption", raw: {} };
+    }
+    // 280 is an X limit, not a universal one — LinkedIn cases run ~1700 chars
+    // and are perfectly valid, so this check belongs here, not in the gate.
+    if (caption.length > 280) {
       return {
         ok: false,
         url: null,
-        error:
-          "X credentials are not configured. Set xCredentials.{apiKeyRef,apiSecretRef,accessTokenRef,accessSecretRef} in plugin config as secret references.",
-        raw: { configured: false },
+        error: `caption is ${caption.length} chars, X allows 280`,
+        raw: { length: caption.length },
       };
     }
 
-    const text = req.caption.trim();
-    if (text.length > X_MAX_CHARS) {
-      return {
-        ok: false,
-        url: null,
-        error: `caption is ${text.length} characters, over the ${X_MAX_CHARS} limit for X`,
-        raw: { length: text.length },
-      };
-    }
-
-    // Media is not attached yet: v2 has no upload endpoint, it needs the v1.1
-    // media/upload flow. Posting text-only would silently drop the image the
-    // reviewer approved, so refuse instead.
+    let mediaPath: string | null = null;
     if (req.mediaFile) {
-      return {
-        ok: false,
-        url: null,
-        error:
-          "case has media attached and media upload is not implemented yet; refusing to post text-only and silently drop the image",
-        raw: { mediaFile: req.mediaFile },
-      };
+      mediaPath = req.mediaFile.startsWith("/")
+        ? req.mediaFile
+        : `${MEDIA_DIR}/${req.mediaFile}`;
+      if (!existsSync(mediaPath)) {
+        // Fail rather than quietly posting text-only. A visual post that
+        // silently loses its image is worse than one that does not go out.
+        return {
+          ok: false,
+          url: null,
+          error: `media file not found: ${mediaPath}`,
+          raw: { mediaFile: req.mediaFile },
+        };
+      }
     }
 
-    const body = JSON.stringify({ text });
-    // Public endpoint: use the audited host client so the call is traced.
-    const res = await ctx.http.fetch(X_TWEETS_URL, {
-      method: "POST",
-      headers: {
-        // Body deliberately excluded from the signature — see authHeaderFor.
-        Authorization: authHeaderFor("POST", X_TWEETS_URL, creds),
-        "Content-Type": "application/json",
-      },
-      body,
+    const payload = JSON.stringify({
+      text: caption,
+      media: mediaPath,
+      alt: req.entry.altText ?? null,
     });
 
-    const raw = await res.text();
-    let parsed: Record<string, unknown> = {};
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      parsed = { body: raw.slice(0, 400) };
-    }
+    return new Promise<PublishResult>((resolve) => {
+      const child = spawn("python3", [X_PUBLISH_SCRIPT, payload], {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 180_000,
+      });
 
-    if (!res.ok) {
-      return {
-        ok: false,
-        url: null,
-        error: `X API ${res.status}: ${raw.slice(0, 200)}`,
-        raw: { status: res.status, ...parsed },
-      };
-    }
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (c: Buffer) => { out += String(c); });
+      child.stderr.on("data", (c: Buffer) => { err += String(c); });
 
-    const id = (parsed as { data?: { id?: string } }).data?.id;
-    if (!id) {
-      return {
-        ok: false,
-        url: null,
-        error: `X returned ${res.status} but no tweet id`,
-        raw: parsed,
-      };
-    }
+      child.on("close", () => {
+        try {
+          const line = out.trim().split("\n").filter(Boolean).pop() ?? "{}";
+          const r = JSON.parse(line) as {
+            ok?: boolean; url?: string; media_id?: string; error?: string;
+          };
+          if (r.ok === true && r.url) {
+            resolve({
+              ok: true,
+              url: r.url,
+              error: null,
+              raw: { mediaId: r.media_id ?? null, hadMedia: Boolean(mediaPath) },
+            });
+          } else {
+            resolve({
+              ok: false,
+              url: null,
+              error: r.error ?? "publisher reported failure without a reason",
+              raw: { implemented: true },
+            });
+          }
+        } catch {
+          resolve({
+            ok: false,
+            url: null,
+            error: (err.trim() || out.trim() || "no output from publisher")
+              .slice(0, 300),
+            raw: { implemented: true, unparseable: true },
+          });
+        }
+      });
 
-    return {
-      ok: true,
-      url: `https://x.com/i/web/status/${id}`,
-      error: null,
-      raw: parsed,
-    };
+      child.on("error", (e) => {
+        resolve({ ok: false, url: null, error: e.message, raw: {} });
+      });
+    });
   },
 };
 
 /**
- * LinkedIn — not implemented. Reports unconfigured so the gate records
- * "skipped, no configured adapter" rather than ever claiming a false success.
+ * LinkedIn stays UNIMPLEMENTED on purpose.
+ *
+ * The only token we hold is `w_member_social`, which posts to JC's PERSONAL
+ * profile rather than the Untrace company page. Wiring this up would publish
+ * company content to an individual's feed. It stays disabled until the
+ * Community Management API application is approved.
  */
+
 const linkedinAdapter: ChannelAdapter = {
   channel: "linkedin",
   async isConfigured() {

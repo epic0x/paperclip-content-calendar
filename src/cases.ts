@@ -55,6 +55,8 @@ export interface CalendarEntry {
   caption: string | null;
   mediaFile: string | null;
   publishUrl: string | null;
+  /** Accessibility text for attached media. X requires alt on every image. */
+  altText: string | null;
   /** True when the case is in the native `approved` status. */
   approved: boolean;
 }
@@ -131,15 +133,20 @@ export async function readConfig(
 async function authHeader(
   ctx: PluginContext,
   cfg: CalendarConfig,
+  companyId: string,
 ): Promise<string> {
   if (!cfg.boardApiKeyRef) {
     throw new CasesNotConfiguredError(
       "boardApiKeyRef is not set in plugin config. Create one with `paperclipai token board create`, store it as a secret, and reference it from the plugin settings page.",
     );
   }
+  // companyId is REQUIRED: without it the host sees a global-scoped call and
+  // denies with "secrets.resolve: company context is required", which made
+  // every sweep read zero cases. Note both keys go in the same options object —
+  // the SDK signature here is resolve(ref, { companyId?, configPath? }).
   const key = await ctx.secrets.resolve(
     cfg.boardApiKeyRef as string,
-    { configPath: "boardApiKeyRef" },
+    { companyId, configPath: "boardApiKeyRef" },
   );
   if (!key) {
     throw new CasesNotConfiguredError(
@@ -199,12 +206,13 @@ async function apiGet<T>(
   ctx: PluginContext,
   cfg: CalendarConfig,
   path: string,
+  companyId: string,
 ): Promise<T> {
   const url = `${cfg.apiBaseUrl}${path}`;
   const res = await fetchFor(ctx, url)(url, {
     method: "GET",
     headers: {
-      Authorization: await authHeader(ctx, cfg),
+      Authorization: await authHeader(ctx, cfg, companyId),
       Accept: "application/json",
     },
   });
@@ -237,6 +245,7 @@ export function toEntry(c: PaperclipCase): CalendarEntry {
     caption: str(fields[FIELD_CAPTION]),
     mediaFile: str(fields[FIELD_MEDIA]),
     publishUrl: str(fields[FIELD_PUBLISH_URL]),
+    altText: str(fields.alt_text),
     // Approval is the NATIVE case status, never a JSON field. See
     // Agents/paperclip-native-scheduling.md in the knowledge graph.
     approved: c.status === "approved",
@@ -265,6 +274,7 @@ export async function listSocialCases(
     ctx,
     cfg,
     `/api/companies/${companyId}/cases?${qs.toString()}`,
+    companyId,
   );
   const batch = Array.isArray(body) ? body : (body.cases ?? []);
   if (batch.length >= limit) {
@@ -288,12 +298,14 @@ export async function patchCaseFields(
   cfg: CalendarConfig,
   caseIdOrIdentifier: string,
   patch: Record<string, unknown>,
-  status?: CaseStatus,
+  status: CaseStatus | undefined,
+  companyId: string,
 ): Promise<PaperclipCase> {
   const current = await apiGet<PaperclipCase | { case: PaperclipCase }>(
     ctx,
     cfg,
     `/api/cases/${encodeURIComponent(caseIdOrIdentifier)}`,
+    companyId,
   );
   const existing = "case" in current ? current.case : current;
 
@@ -305,7 +317,7 @@ export async function patchCaseFields(
   const res = await fetchFor(ctx, patchUrl)(patchUrl, {
     method: "PATCH",
     headers: {
-      Authorization: await authHeader(ctx, cfg),
+      Authorization: await authHeader(ctx, cfg, companyId),
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),

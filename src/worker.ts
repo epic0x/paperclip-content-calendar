@@ -237,7 +237,8 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
     );
 
     try {
-      await patchCaseFields(ctx, cfg, identifier, { publish_at: publishAt });
+      await patchCaseFields(ctx, cfg, identifier, { publish_at: publishAt },
+                            undefined, companyId);
       await ctx.db.execute(
         `UPDATE ${overrides()}
             SET applied_to_case = TRUE, updated_at = NOW()
@@ -290,6 +291,7 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
       identifier,
       {},
       status as CaseStatus,
+      companyId,
     );
 
     await ctx.activity.log({
@@ -423,7 +425,7 @@ async function attemptOne(
   try {
     await patchCaseFields(ctx, cfg, entry.identifier, {
       publish_url: result.url,
-    });
+    }, undefined, companyId);
   } catch (err) {
     ctx.logger.warn(
       `[content-calendar] published ${entry.identifier} but could not write publish_url back: ${
@@ -514,7 +516,11 @@ async function publishSweep(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     ctx.logger.error(`[content-calendar] cannot read cases: ${message}`);
-    return summary;
+    // RETHROW. Returning an empty summary here marked the job "completed
+    // successfully" while it had read zero cases — 32 real failures reported
+    // as 16 successes in 20 minutes, with the dashboard green throughout.
+    // A sweep that cannot read its input has failed and must say so.
+    throw err;
   }
 
   const sent = await sentCaseIds(ctx, companyId);
