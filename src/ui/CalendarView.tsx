@@ -143,49 +143,94 @@ function Stat({ label, value, tone }: { label: string; value: number; tone?: str
 function EntryChip({
   entry,
   onSelect,
+  onQuickApprove,
+  busy,
 }: {
   entry: CalendarEntry;
   onSelect: (e: CalendarEntry) => void;
+  onQuickApprove: (e: CalendarEntry) => void;
+  busy: boolean;
 }) {
+  const canQuickApprove =
+    !entry.approved &&
+    !entry.publishUrl &&
+    entry.status !== "cancelled" &&
+    entry.status !== "done";
+
   return (
-    <button
-      type="button"
-      onClick={() => onSelect(entry)}
-      title={`${entry.identifier} — ${entry.title}`}
+    <div
       style={{
         display: "flex",
-        alignItems: "center",
-        gap: 5,
-        width: "100%",
-        textAlign: "left",
-        background: entry.publishUrl ? "#14432a" : "#27272a",
-        border: "none",
-        borderLeft: `3px solid ${channelColor(entry.channel)}`,
-        borderRadius: 3,
-        padding: "3px 5px",
+        alignItems: "stretch",
+        gap: 2,
         marginBottom: 2,
-        cursor: "pointer",
-        color: "#e4e4e7",
-        fontSize: 11,
-        overflow: "hidden",
       }}
     >
-      <span style={{ color: "#a1a1aa", fontVariantNumeric: "tabular-nums" }}>
-        {timeOf(entry.publishAt)}
-      </span>
-      <span
+      <button
+        type="button"
+        onClick={() => onSelect(entry)}
+        title={`${entry.identifier} — ${entry.title}`}
         style={{
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
+          display: "flex",
+          alignItems: "center",
+          gap: 5,
           flex: 1,
+          minWidth: 0,
+          textAlign: "left",
+          background: entry.publishUrl ? "#14432a" : "#27272a",
+          border: "none",
+          borderLeft: `3px solid ${channelColor(entry.channel)}`,
+          borderRadius: 3,
+          padding: "3px 5px",
+          cursor: "pointer",
+          color: "#e4e4e7",
+          fontSize: 11,
+          overflow: "hidden",
         }}
       >
-        {entry.title}
-      </span>
-      {entry.approved && <span style={{ color: "#4ade80" }}>✓</span>}
-      {entry.publishUrl && <span style={{ color: "#4ade80" }}>↗</span>}
-    </button>
+        <span style={{ color: "#a1a1aa", fontVariantNumeric: "tabular-nums" }}>
+          {timeOf(entry.publishAt)}
+        </span>
+        <span
+          style={{
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            flex: 1,
+          }}
+        >
+          {entry.title}
+        </span>
+        {entry.approved && <span style={{ color: "#4ade80" }}>✓</span>}
+        {entry.publishUrl && <span style={{ color: "#4ade80" }}>↗</span>}
+      </button>
+
+      {canQuickApprove && (
+        <button
+          type="button"
+          disabled={busy}
+          title="Approve this post"
+          onClick={(e) => {
+            e.stopPropagation();
+            onQuickApprove(entry);
+          }}
+          style={{
+            background: "#166534",
+            border: "none",
+            borderRadius: 3,
+            color: "#fff",
+            fontSize: 10,
+            lineHeight: 1,
+            padding: "0 6px",
+            cursor: busy ? "default" : "pointer",
+            opacity: busy ? 0.5 : 1,
+            flexShrink: 0,
+          }}
+        >
+          ✓
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -193,16 +238,26 @@ function DetailPanel({
   entry,
   onClose,
   onReschedule,
+  onSetStatus,
+  onPostNow,
   busy,
+  postResult,
 }: {
   entry: CalendarEntry;
   onClose: () => void;
   onReschedule: (iso: string) => void;
-  busy: boolean;
+  onSetStatus: (status: "approved" | "in_review") => void;
+  onPostNow: () => void;
+  busy: string | null;
+  postResult: { ok: boolean; text: string } | null;
 }) {
   const [when, setWhen] = useState(
     entry.publishAt ? entry.publishAt.slice(0, 16) : "",
   );
+  const [confirmPost, setConfirmPost] = useState(false);
+
+  const alreadyPublished = Boolean(entry.publishUrl);
+  const terminal = entry.status === "cancelled" || entry.status === "done";
 
   return (
     <div
@@ -282,15 +337,159 @@ function DetailPanel({
         </pre>
       )}
 
-      {entry.publishUrl ? (
+      {alreadyPublished && (
         <p style={{ marginTop: 14, fontSize: 12 }}>
-          <a href={entry.publishUrl} target="_blank" rel="noreferrer" style={{ color: "#4ade80" }}>
+          <a href={entry.publishUrl as string} target="_blank" rel="noreferrer" style={{ color: "#4ade80" }}>
             Published → {entry.publishUrl}
           </a>
         </p>
-      ) : null}
+      )}
 
-      <div style={{ marginTop: 20, borderTop: "1px solid #27272a", paddingTop: 16 }}>
+      {/* ---- Approval: writes the native case status ---- */}
+      {!terminal && (
+        <div style={{ marginTop: 20, borderTop: "1px solid #27272a", paddingTop: 16 }}>
+          <label style={{ fontSize: 11, color: "#a1a1aa", display: "block", marginBottom: 8 }}>
+            Approval
+          </label>
+          {entry.approved ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+              <span style={{ color: "#4ade80", fontSize: 13 }}>✓ Approved</span>
+              <button
+                type="button"
+                disabled={busy !== null}
+                onClick={() => onSetStatus("in_review")}
+                style={{
+                  background: "transparent",
+                  border: "1px solid #3f3f46",
+                  borderRadius: 6,
+                  color: "#a1a1aa",
+                  padding: "4px 10px",
+                  fontSize: 11,
+                  cursor: busy ? "default" : "pointer",
+                }}
+              >
+                {busy === "status" ? "Saving…" : "Move back to review"}
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              disabled={busy !== null}
+              onClick={() => onSetStatus("approved")}
+              style={{
+                background: busy ? "#3f3f46" : "#15803d",
+                border: "none",
+                borderRadius: 6,
+                color: "#fff",
+                padding: "7px 16px",
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: busy ? "default" : "pointer",
+              }}
+            >
+              {busy === "status" ? "Approving…" : "✓ Approve"}
+            </button>
+          )}
+          <p style={{ fontSize: 11, color: "#71717a", marginTop: 8, lineHeight: 1.5 }}>
+            This sets the case status in Paperclip — the same field the case page
+            writes, and it is logged the same way.
+          </p>
+        </div>
+      )}
+
+      {/* ---- Post Now ---- */}
+      {!terminal && !alreadyPublished && (
+        <div style={{ marginTop: 18, borderTop: "1px solid #27272a", paddingTop: 16 }}>
+          <label style={{ fontSize: 11, color: "#a1a1aa", display: "block", marginBottom: 8 }}>
+            Publish
+          </label>
+
+          {!entry.approved ? (
+            <p style={{ fontSize: 12, color: "#71717a", margin: 0, lineHeight: 1.5 }}>
+              Approve first. Posting is blocked until the case is approved.
+            </p>
+          ) : !confirmPost ? (
+            <button
+              type="button"
+              disabled={busy !== null}
+              onClick={() => setConfirmPost(true)}
+              style={{
+                background: "#1d4ed8",
+                border: "none",
+                borderRadius: 6,
+                color: "#fff",
+                padding: "7px 16px",
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: busy ? "default" : "pointer",
+              }}
+            >
+              Post now
+            </button>
+          ) : (
+            <div>
+              <p style={{ fontSize: 12, color: "#fbbf24", margin: "0 0 10px", lineHeight: 1.5 }}>
+                This publishes to <strong>{entry.channel}</strong> immediately and
+                publicly. It cannot be undone from here.
+              </p>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  type="button"
+                  disabled={busy !== null}
+                  onClick={() => {
+                    setConfirmPost(false);
+                    onPostNow();
+                  }}
+                  style={{
+                    background: busy ? "#3f3f46" : "#b91c1c",
+                    border: "none",
+                    borderRadius: 6,
+                    color: "#fff",
+                    padding: "7px 16px",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    cursor: busy ? "default" : "pointer",
+                  }}
+                >
+                  {busy === "post" ? "Posting…" : `Yes, post to ${entry.channel}`}
+                </button>
+                <button
+                  type="button"
+                  disabled={busy !== null}
+                  onClick={() => setConfirmPost(false)}
+                  style={{
+                    background: "transparent",
+                    border: "1px solid #3f3f46",
+                    borderRadius: 6,
+                    color: "#a1a1aa",
+                    padding: "7px 14px",
+                    fontSize: 13,
+                    cursor: "pointer",
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
+          {postResult && (
+            <p
+              style={{
+                marginTop: 10,
+                fontSize: 12,
+                lineHeight: 1.5,
+                color: postResult.ok ? "#4ade80" : "#f87171",
+              }}
+            >
+              {postResult.text}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* ---- Schedule ---- */}
+      <div style={{ marginTop: 18, borderTop: "1px solid #27272a", paddingTop: 16 }}>
         <label style={{ fontSize: 11, color: "#a1a1aa", display: "block", marginBottom: 6 }}>
           Publish at (UTC)
         </label>
@@ -311,7 +510,7 @@ function DetailPanel({
           />
           <button
             type="button"
-            disabled={busy || !when}
+            disabled={busy !== null || !when}
             onClick={() => onReschedule(`${when}:00Z`)}
             style={{
               background: busy ? "#3f3f46" : "#2563eb",
@@ -323,14 +522,9 @@ function DetailPanel({
               cursor: busy ? "default" : "pointer",
             }}
           >
-            {busy ? "Saving…" : "Save"}
+            {busy === "reschedule" ? "Saving…" : "Save"}
           </button>
         </div>
-        <p style={{ fontSize: 11, color: "#71717a", marginTop: 8, lineHeight: 1.5 }}>
-          Approval is the case status, not a field here. Move the case to{" "}
-          <strong style={{ color: "#4ade80" }}>Approved</strong> in Paperclip and the
-          publish job will pick it up when it is due.
-        </p>
       </div>
     </div>
   );
@@ -346,7 +540,8 @@ export function CalendarView({ companyId }: { companyId: string | null }) {
   const [month, setMonth] = useState(today.getUTCMonth());
   const [selected, setSelected] = useState<CalendarEntry | null>(null);
   const [channelFilter, setChannelFilter] = useState<string>("all");
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [postResult, setPostResult] = useState<{ ok: boolean; text: string } | null>(null);
 
   const grid = useMemo(() => monthGrid(year, month), [year, month]);
   const from = grid[0];
@@ -357,6 +552,8 @@ export function CalendarView({ companyId }: { companyId: string | null }) {
     companyId ? { companyId, from, to } : undefined,
   );
   const reschedule = usePluginAction("reschedule");
+  const setStatus = usePluginAction("set-status");
+  const postNow = usePluginAction("post-now");
 
   const byDay = useMemo(() => {
     const m = new Map<string, CalendarEntry[]>();
@@ -413,7 +610,7 @@ export function CalendarView({ companyId }: { companyId: string | null }) {
 
   const onReschedule = async (iso: string) => {
     if (!selected) return;
-    setBusy(true);
+    setBusy("reschedule");
     try {
       await reschedule({
         companyId,
@@ -425,7 +622,84 @@ export function CalendarView({ companyId }: { companyId: string | null }) {
       setSelected(null);
       refresh();
     } finally {
-      setBusy(false);
+      setBusy(null);
+    }
+  };
+
+  const onSetStatus = async (status: "approved" | "in_review") => {
+    if (!selected) return;
+    setBusy("status");
+    setPostResult(null);
+    try {
+      await setStatus({
+        companyId,
+        caseId: selected.id,
+        caseIdentifier: selected.identifier,
+        status,
+      });
+      // Keep the panel open and reflect the change immediately, so the Post Now
+      // button unlocks in place rather than after a round trip.
+      setSelected({ ...selected, status, approved: status === "approved" });
+      refresh();
+    } catch (err) {
+      setPostResult({
+        ok: false,
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /** One-click approve straight from a calendar chip, no panel needed. */
+  const onQuickApprove = async (entry: CalendarEntry) => {
+    setBusy("status");
+    try {
+      await setStatus({
+        companyId,
+        caseId: entry.id,
+        caseIdentifier: entry.identifier,
+        status: "approved",
+      });
+      refresh();
+    } catch (err) {
+      setPostResult({
+        ok: false,
+        text: `${entry.identifier}: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const onPostNow = async () => {
+    if (!selected) return;
+    setBusy("post");
+    setPostResult(null);
+    try {
+      const res = (await postNow({
+        companyId,
+        caseId: selected.id,
+        caseIdentifier: selected.identifier,
+      })) as { ok?: boolean; outcome?: string; reason?: string; url?: string } | null;
+
+      if (res?.ok && res.url) {
+        setPostResult({ ok: true, text: `Posted → ${res.url}` });
+        setSelected({ ...selected, publishUrl: res.url });
+      } else {
+        setPostResult({
+          ok: false,
+          text: `Not posted (${res?.outcome ?? "unknown"}): ${res?.reason ?? "no reason returned"}`,
+        });
+      }
+      refresh();
+    } catch (err) {
+      setPostResult({
+        ok: false,
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setBusy(null);
     }
   };
 
@@ -529,7 +803,13 @@ export function CalendarView({ companyId }: { companyId: string | null }) {
                 {Number(date.slice(8, 10))}
               </div>
               {entries.map((e) => (
-                <EntryChip key={e.id} entry={e} onSelect={setSelected} />
+                <EntryChip
+                  key={e.id}
+                  entry={e}
+                  onSelect={setSelected}
+                  onQuickApprove={onQuickApprove}
+                  busy={busy !== null}
+                />
               ))}
             </div>
           );
@@ -569,8 +849,14 @@ export function CalendarView({ companyId }: { companyId: string | null }) {
         <DetailPanel
           entry={selected}
           busy={busy}
-          onClose={() => setSelected(null)}
+          postResult={postResult}
+          onClose={() => {
+            setSelected(null);
+            setPostResult(null);
+          }}
           onReschedule={onReschedule}
+          onSetStatus={onSetStatus}
+          onPostNow={onPostNow}
         />
       )}
     </div>

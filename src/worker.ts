@@ -17,6 +17,7 @@ import {
   readConfig,
   type CalendarConfig,
   type CalendarEntry,
+  type CaseStatus,
 } from "./cases.js";
 import { adapterFor } from "./channels.js";
 import { evaluate } from "./gate.js";
@@ -256,10 +257,69 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
     }
   });
 
-  /** run-publish-now — fire the publish sweep on demand. Same gate applies. */
-  ctx.actions.register("run-publish-now", async (params) => {
+  /**
+   * set-status — approve or un-approve a case from the calendar.
+   *
+   * This writes the NATIVE case status, the same field the Paperclip case view
+   * writes. It is a shortcut for the existing review action, not a second
+   * approval mechanism, so approving here and approving there are identical and
+   * both emit a `status_changed` case event.
+   *
+   * Only the review transitions are allowed. Publishing, cancelling and
+   * completing are deliberately not exposed on a calendar chip.
+   */
+  ctx.actions.register("set-status", async (params, actionContext) => {
     const companyId = requireStr(params.companyId, "companyId");
-    return await publishSweep(ctx, companyId, "manual");
+    const identifier = requireStr(params.caseIdentifier, "caseIdentifier");
+    const status = requireStr(params.status, "status");
+
+    const ALLOWED = new Set(["approved", "in_review"]);
+    if (!ALLOWED.has(status)) {
+      throw new Error(
+        `status "${status}" is not settable from the calendar; allowed: ${[...ALLOWED].join(", ")}`,
+      );
+    }
+
+    const cfg = await readConfig(ctx, companyId);
+    // Empty patch: fields are preserved, only status moves. patchCaseFields
+    // still reads first and re-sends the whole object, because Paperclip
+    // replaces `fields` wholesale on PATCH.
+    const updated = await patchCaseFields(
+      ctx,
+      cfg,
+      identifier,
+      {},
+      status as CaseStatus,
+    );
+
+    await ctx.activity.log({
+      companyId,
+      message: `Case ${identifier} set to ${status} from the content calendar`,
+      entityType: "case",
+      entityId: updated.id,
+      metadata: {
+        status,
+        // userId lives under actor, not on the context root.
+        actor: actionContext?.actor?.userId ?? "calendar-ui",
+      },
+    });
+
+    return { ok: true, identifier, status: updated.status };
+  });
+
+  /**
+   * post-now — publish one case immediately.
+   *
+   * Runs the same gate as the scheduled job with `manual: true`, which
+   * substitutes for the autoPost switch and ignores the schedule. Every other
+   * protection still applies: approval, double-post, caption, channel and
+   * adapter checks all block exactly as they do on the cron path.
+   */
+  ctx.actions.register("post-now", async (params, actionContext) => {
+    const companyId = requireStr(params.companyId, "companyId");
+    const caseId = requireStr(params.caseId, "caseId");
+    const actor = actionContext?.actor?.userId ?? "calendar-ui";
+    return await publishOne(ctx, companyId, caseId, `manual:${actor}`);
   });
 }
 
@@ -277,6 +337,157 @@ interface SweepSummary {
   skipped: number;
   autoPost: boolean;
   details: Array<{ case: string; outcome: string; reason: string }>;
+}
+
+interface AttemptResult {
+  outcome: "sent" | "dry_run" | "failed" | "skipped";
+  reason: string;
+  url: string | null;
+}
+
+/**
+ * Publish exactly one case. THE single publish path.
+ *
+ * Both the scheduled sweep and the Post Now button call this, so the gate,
+ * the double-post interlock, the attempt log and the write-back can never
+ * drift apart between the automatic and manual routes. `manual` is passed
+ * straight through to the gate.
+ */
+async function attemptOne(
+  ctx: PluginContext,
+  cfg: CalendarConfig,
+  companyId: string,
+  entry: CalendarEntry,
+  opts: { manual: boolean; alreadySent: boolean; now: Date },
+): Promise<AttemptResult> {
+  const adapter = adapterFor(entry.channel);
+  const adapterReady = adapter ? await adapter.isConfigured(ctx, cfg) : false;
+
+  const decision = evaluate({
+    entry,
+    now: opts.now,
+    autoPost: cfg.autoPost,
+    enabledChannels: cfg.channels.map((c) => c.toLowerCase()),
+    lookbackHours: cfg.lookbackHours,
+    alreadySent: opts.alreadySent,
+    adapterReady,
+    manual: opts.manual,
+  });
+
+  if (decision.outcome === "skipped") {
+    return { outcome: "skipped", reason: decision.reason, url: null };
+  }
+
+  if (decision.outcome === "dry_run") {
+    await recordAttempt(ctx, {
+      companyId,
+      entry,
+      outcome: "dry_run",
+      reason: decision.reason,
+      postUrl: null,
+      raw: { autoPost: false, manual: opts.manual },
+    });
+    return { outcome: "dry_run", reason: decision.reason, url: null };
+  }
+
+  // decision.outcome === "publish"
+  const result = await (adapter as NonNullable<typeof adapter>).publish(ctx, cfg, {
+    entry,
+    caption: entry.caption as string,
+    mediaFile: entry.mediaFile,
+  });
+
+  if (!result.ok || !result.url) {
+    const reason = result.error ?? "adapter returned no url";
+    await recordAttempt(ctx, {
+      companyId,
+      entry,
+      outcome: "failed",
+      reason,
+      postUrl: null,
+      raw: result.raw,
+    });
+    return { outcome: "failed", reason, url: null };
+  }
+
+  await recordAttempt(ctx, {
+    companyId,
+    entry,
+    outcome: "sent",
+    reason: null,
+    postUrl: result.url,
+    raw: result.raw,
+  });
+
+  // Write the URL back onto the case, merged — never a bare field patch.
+  try {
+    await patchCaseFields(ctx, cfg, entry.identifier, {
+      publish_url: result.url,
+    });
+  } catch (err) {
+    ctx.logger.warn(
+      `[content-calendar] published ${entry.identifier} but could not write publish_url back: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+
+  await ctx.activity.log({
+    companyId,
+    message: `Published ${entry.identifier} to ${entry.channel}: ${result.url}`,
+    entityType: "case",
+    entityId: entry.id,
+    metadata: { channel: entry.channel, url: result.url, manual: opts.manual },
+  });
+
+  return { outcome: "sent", reason: decision.reason, url: result.url };
+}
+
+/** Post Now: resolve one case, run the shared path with manual authorization. */
+async function publishOne(
+  ctx: PluginContext,
+  companyId: string,
+  caseId: string,
+  trigger: string,
+): Promise<{
+  ok: boolean;
+  outcome: string;
+  reason: string;
+  url: string | null;
+  identifier: string | null;
+}> {
+  const cfg = await readConfig(ctx, companyId);
+  const entries = await listSocialCases(ctx, cfg, companyId);
+  const entry = entries.find((e) => e.id === caseId || e.identifier === caseId);
+
+  if (!entry) {
+    return {
+      ok: false,
+      outcome: "skipped",
+      reason: `case ${caseId} not found among social_post cases`,
+      url: null,
+      identifier: null,
+    };
+  }
+
+  const sent = await sentCaseIds(ctx, companyId);
+  const res = await attemptOne(ctx, cfg, companyId, entry, {
+    manual: true,
+    alreadySent: sent.has(entry.id),
+    now: new Date(),
+  });
+
+  ctx.logger.info(
+    `[content-calendar] ${trigger} ${entry.identifier} -> ${res.outcome} (${res.reason})`,
+  );
+
+  return {
+    ok: res.outcome === "sent",
+    outcome: res.outcome,
+    reason: res.reason,
+    url: res.url,
+    identifier: entry.identifier,
+  };
 }
 
 async function publishSweep(
@@ -308,7 +519,6 @@ async function publishSweep(
 
   const sent = await sentCaseIds(ctx, companyId);
   const now = new Date();
-  const enabled = cfg.channels.map((c) => c.toLowerCase());
 
   for (const entry of entries) {
     // Cheap pre-filter: only cases that could conceivably go out today.
@@ -317,108 +527,24 @@ async function publishSweep(
     }
     summary.evaluated += 1;
 
-    const adapter = adapterFor(entry.channel);
-    const adapterReady = adapter
-      ? await adapter.isConfigured(ctx, cfg)
-      : false;
-
-    const decision = evaluate({
-      entry,
-      now,
-      autoPost: cfg.autoPost,
-      enabledChannels: enabled,
-      lookbackHours: cfg.lookbackHours,
+    const res = await attemptOne(ctx, cfg, companyId, entry, {
+      manual: false,
       alreadySent: sent.has(entry.id),
-      adapterReady,
+      now,
     });
 
-    if (decision.outcome === "skipped") {
-      summary.skipped += 1;
-      // Only persist interesting skips — "not due yet" would flood the table
-      // every 15 minutes for every future post.
-      if (decision.reason !== "not due yet") {
-        summary.details.push({
-          case: entry.identifier,
-          outcome: "skipped",
-          reason: decision.reason,
-        });
-      }
-      continue;
-    }
+    if (res.outcome === "sent") summary.published += 1;
+    else if (res.outcome === "dry_run") summary.dryRun += 1;
+    else if (res.outcome === "failed") summary.failed += 1;
+    else summary.skipped += 1;
 
-    if (decision.outcome === "dry_run") {
-      summary.dryRun += 1;
+    // "not due yet" would flood the log every 15 minutes for every future
+    // post, so it is counted but not itemised.
+    if (res.outcome !== "skipped" || res.reason !== "not due yet") {
       summary.details.push({
         case: entry.identifier,
-        outcome: "dry_run",
-        reason: decision.reason,
-      });
-      await recordAttempt(ctx, {
-        companyId,
-        entry,
-        outcome: "dry_run",
-        reason: decision.reason,
-        postUrl: null,
-        raw: { autoPost: false },
-      });
-      continue;
-    }
-
-    // decision.outcome === "publish"
-    const result = await (adapter as NonNullable<typeof adapter>).publish(ctx, cfg, {
-      entry,
-      caption: entry.caption as string,
-      mediaFile: entry.mediaFile,
-    });
-
-    if (result.ok && result.url) {
-      await recordAttempt(ctx, {
-        companyId,
-        entry,
-        outcome: "sent",
-        reason: null,
-        postUrl: result.url,
-        raw: result.raw,
-      });
-      // Write the URL back onto the case, merged — never a bare field patch.
-      try {
-        await patchCaseFields(ctx, cfg, entry.identifier, {
-          publish_url: result.url,
-        });
-      } catch (err) {
-        ctx.logger.warn(
-          `[content-calendar] published ${entry.identifier} but could not write publish_url back: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
-      summary.published += 1;
-      summary.details.push({
-        case: entry.identifier,
-        outcome: "sent",
-        reason: result.url,
-      });
-      await ctx.activity.log({
-        companyId,
-        message: `Published ${entry.identifier} to ${entry.channel}: ${result.url}`,
-        entityType: "case",
-        entityId: entry.id,
-        metadata: { channel: entry.channel, url: result.url },
-      });
-    } else {
-      await recordAttempt(ctx, {
-        companyId,
-        entry,
-        outcome: "failed",
-        reason: result.error ?? "adapter returned no url",
-        postUrl: null,
-        raw: result.raw,
-      });
-      summary.failed += 1;
-      summary.details.push({
-        case: entry.identifier,
-        outcome: "failed",
-        reason: result.error ?? "adapter returned no url",
+        outcome: res.outcome,
+        reason: res.url ?? res.reason,
       });
     }
   }

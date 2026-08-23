@@ -65,6 +65,13 @@ export interface CalendarConfig {
   autoPost: boolean;
   channels: string[];
   lookbackHours: number;
+  /** Secret references for the X OAuth 1.0a credential set. */
+  xCredentials?: {
+    apiKeyRef?: unknown;
+    apiSecretRef?: unknown;
+    accessTokenRef?: unknown;
+    accessSecretRef?: unknown;
+  };
 }
 
 export class CasesApiError extends Error {
@@ -111,6 +118,10 @@ export async function readConfig(
       ? raw.channels.filter((c): c is string => typeof c === "string")
       : DEFAULTS.channels,
     lookbackHours: num(raw.lookbackHours, DEFAULTS.lookbackHours),
+    xCredentials:
+      raw.xCredentials && typeof raw.xCredentials === "object"
+        ? (raw.xCredentials as CalendarConfig["xCredentials"])
+        : undefined,
   };
 }
 

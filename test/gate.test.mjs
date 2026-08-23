@@ -117,3 +117,82 @@ test("already-sent beats every other condition", () => {
   );
   assert.equal(d.reason, "already published");
 });
+
+// ---------------------------------------------------------------------------
+// Post Now (manual). It is an AUTHORIZATION scoped to one case, not a bypass.
+// These tests are the contract: they pin down exactly what a human click can
+// and cannot override.
+// ---------------------------------------------------------------------------
+
+test("manual publishes with autoPost OFF — that is the point of the button", () => {
+  const d = evaluate(input({}, { autoPost: false, manual: true }));
+  assert.equal(d.outcome, "publish");
+  assert.match(d.reason, /manually/);
+});
+
+test("manual ignores the schedule: a future post can be sent now", () => {
+  const d = evaluate(
+    input({ publishAt: "2027-01-01T00:00:00Z" }, { autoPost: false, manual: true }),
+  );
+  assert.equal(d.outcome, "publish");
+});
+
+test("manual ignores the catch-up window: a stale post can be sent now", () => {
+  const d = evaluate(
+    input({ publishAt: "2026-01-01T00:00:00Z" }, { autoPost: false, manual: true }),
+  );
+  assert.equal(d.outcome, "publish");
+});
+
+test("manual works on a case with NO publish_at at all", () => {
+  const d = evaluate(input({ publishAt: null }, { autoPost: false, manual: true }));
+  assert.equal(d.outcome, "publish");
+});
+
+test("manual CANNOT publish an unapproved case", () => {
+  const d = evaluate(
+    input({ status: "in_review", approved: false }, { manual: true, autoPost: true }),
+  );
+  assert.equal(d.outcome, "skipped");
+  assert.match(d.reason, /needs "approved"/);
+});
+
+test("manual CANNOT double-post", () => {
+  const d = evaluate(input({}, { manual: true, alreadySent: true }));
+  assert.equal(d.outcome, "skipped");
+  assert.equal(d.reason, "already published");
+});
+
+test("manual CANNOT repost a case that already has a publish_url", () => {
+  const d = evaluate(input({ publishUrl: "https://x.com/u/1" }, { manual: true }));
+  assert.equal(d.outcome, "skipped");
+});
+
+test("manual CANNOT publish a cancelled or done case", () => {
+  for (const status of ["cancelled", "done"]) {
+    const d = evaluate(input({ status, approved: false }, { manual: true }));
+    assert.equal(d.outcome, "skipped", status);
+  }
+});
+
+test("manual CANNOT publish without a caption", () => {
+  const d = evaluate(input({ caption: null }, { manual: true }));
+  assert.equal(d.outcome, "skipped");
+});
+
+test("manual CANNOT publish to a disabled channel", () => {
+  const d = evaluate(input({}, { manual: true, enabledChannels: [] }));
+  assert.equal(d.outcome, "skipped");
+  assert.match(d.reason, /not enabled/);
+});
+
+test("manual CANNOT publish through an unconfigured adapter", () => {
+  const d = evaluate(input({}, { manual: true, adapterReady: false }));
+  assert.equal(d.outcome, "skipped");
+  assert.match(d.reason, /no configured adapter/);
+});
+
+test("manual defaults to false when omitted", () => {
+  const d = evaluate(input({}, { autoPost: false }));
+  assert.equal(d.outcome, "dry_run");
+});

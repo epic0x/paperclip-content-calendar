@@ -118,6 +118,18 @@ const manifest: PaperclipPluginManifestV1 = {
         items: { type: "string" },
         default: [],
       },
+      xCredentials: {
+        type: "object",
+        title: "X credentials",
+        description:
+          "Secret references for the X OAuth 1.0a credential set. All four are required to post to X.",
+        properties: {
+          apiKeyRef: { type: "object", title: "API key (secret reference)" },
+          apiSecretRef: { type: "object", title: "API secret (secret reference)" },
+          accessTokenRef: { type: "object", title: "Access token (secret reference)" },
+          accessSecretRef: { type: "object", title: "Access secret (secret reference)" },
+        },
+      },
       lookbackHours: {
         type: "number",
         title: "Catch-up window (hours)",
@@ -133,8 +145,18 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: JOB_PUBLISH_DUE,
       displayName: "Publish due cases",
       description:
-        "Every 15 minutes: find approved social_post cases whose publish_at is due and not yet published, then publish them. With autoPost off, records a dry-run attempt instead of sending.",
-      schedule: "*/15 * * * *",
+        "Every minute: find approved social_post cases whose publish_at is due and not yet published, then publish them. With autoPost off, records a dry-run attempt instead of sending.",
+      // EVERY MINUTE, deliberately.
+      //
+      // This was */15, and that is why a post scheduled for 18:22 sat there:
+      // the next tick was 18:30. A content calendar is judged on "I set it to
+      // the next minute and it went out", so the tick has to be a minute.
+      //
+      // The cost is bounded: a sweep is one cached case list plus one indexed
+      // query, and it does nothing at all unless a case is both approved and
+      // due. The double-post interlock is a database constraint, not a
+      // function of how often this runs.
+      schedule: "* * * * *",
     },
   ],
 
