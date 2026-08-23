@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { dubaiDayKey } from "./time.js";
+import { dubaiDayKey, isHalfHourSlot } from "./time.js";
 import {
   definePlugin,
   runWorker,
@@ -218,6 +218,9 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
     const publishAt = requireStr(params.publishAt, "publishAt");
     if (Number.isNaN(Date.parse(publishAt))) {
       throw new Error(`publishAt is not a valid instant: ${publishAt}`);
+    }
+    if (!isHalfHourSlot(publishAt)) {
+      throw new Error("publishAt must be on a Dubai :00 or :30 time slot");
     }
     const previous =
       typeof params.previousPublishAt === "string"

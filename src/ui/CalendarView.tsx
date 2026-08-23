@@ -237,6 +237,7 @@ function DetailPanel({
   const [when, setWhen] = useState(
     entry.publishAt ? isoToDubaiLocalInput(entry.publishAt) : "",
   );
+  const validSlot = when.length > 0 && [0, 30].includes(Number(when.slice(-2)));
   const [confirmPost, setConfirmPost] = useState(false);
 
   const alreadyPublished = Boolean(entry.publishUrl);
@@ -480,6 +481,7 @@ function DetailPanel({
         <div style={{ display: "flex", gap: 8 }}>
           <input
             type="datetime-local"
+            step={1800}
             value={when}
             onChange={(e) => setWhen(e.target.value)}
             style={{
@@ -494,7 +496,7 @@ function DetailPanel({
           />
           <button
             type="button"
-            disabled={busy !== null || !when}
+            disabled={busy !== null || !validSlot}
             onClick={() => onReschedule(dubaiLocalToIso(when))}
             style={{
               background: busy ? "#3f3f46" : "#2563eb",
@@ -509,6 +511,11 @@ function DetailPanel({
             {busy === "reschedule" ? "Saving…" : "Save"}
           </button>
         </div>
+        {when && !validSlot && (
+          <p style={{ margin: "6px 0 0", color: "#f87171", fontSize: 11 }}>
+            Choose a Dubai time ending in :00 or :30.
+          </p>
+        )}
       </div>
     </div>
   );

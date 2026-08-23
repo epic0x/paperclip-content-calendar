@@ -115,10 +115,10 @@ function authHeaderFor(
  */
 const X_PUBLISH_SCRIPT =
   process.env.PAPERCLIP_X_PUBLISH_SCRIPT ??
-  `${process.env.HOME ?? ""}/.hermes/scripts/x_publish.py`;
+  "/home/openclaw/.hermes/scripts/x_publish.py";
 
 const MEDIA_DIR =
-  process.env.PAPERCLIP_MEDIA_DIR ?? `${process.env.HOME ?? ""}/social/out`;
+  process.env.PAPERCLIP_MEDIA_DIR ?? "/home/openclaw/social/out";
 
 /**
  * X adapter.

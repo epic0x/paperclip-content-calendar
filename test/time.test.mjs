@@ -7,6 +7,7 @@ import {
   dubaiTime,
   dubaiYear,
   isoToDubaiLocalInput,
+  isHalfHourSlot,
 } from "../dist/time.js";
 
 const DUBAI_MIDNIGHT = "2026-08-23T20:51:00Z";
@@ -36,4 +37,10 @@ test("Today uses the Dubai calendar date, not UTC", () => {
 
 test("invalid local input is rejected instead of silently shifting", () => {
   assert.throws(() => dubaiLocalToIso("2026-02-30T12:00"), /valid Dubai date/);
+});
+
+test("only :00 and :30 are valid scheduling slots", () => {
+  assert.equal(isHalfHourSlot("2026-08-23T21:00:00Z"), true);
+  assert.equal(isHalfHourSlot("2026-08-23T21:30:00Z"), true);
+  assert.equal(isHalfHourSlot("2026-08-23T21:08:00Z"), false);
 });

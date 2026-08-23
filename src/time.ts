@@ -70,3 +70,8 @@ export function dubaiYear(value: string | Date): number {
 export function dubaiMonth(value: string | Date): number {
   return shifted(value).getUTCMonth();
 }
+
+export function isHalfHourSlot(value: string | Date): boolean {
+  const date = instant(value);
+  return date.getUTCMinutes() === 0 || date.getUTCMinutes() === 30;
+}

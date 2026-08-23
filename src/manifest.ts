@@ -12,7 +12,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
  * migration statement. If you must change them, recompute the namespace first.
  */
 export const PLUGIN_ID = "untrace.plugin-content-calendar";
-export const PLUGIN_VERSION = "0.2.2";
+export const PLUGIN_VERSION = "0.2.3";
 /** This private deployment serves the single Untrace Network company. */
 export const UNTRACE_COMPANY_ID = "b276d33f-a226-4fd1-95fa-b3f3114ccd9d";
 export const NAMESPACE_SLUG = "content_calendar";
@@ -147,18 +147,11 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: JOB_PUBLISH_DUE,
       displayName: "Publish due cases",
       description:
-        "Every minute: find approved social_post cases whose publish_at is due and not yet published, then publish them. Approved plus due is the whole rule; the emergency pause records a dry run instead of sending.",
-      // EVERY MINUTE, deliberately.
-      //
-      // This was */15, and that is why a post scheduled for 18:22 sat there:
-      // the next tick was 18:30. A content calendar is judged on "I set it to
-      // the next minute and it went out", so the tick has to be a minute.
-      //
-      // The cost is bounded: a sweep is one cached case list plus one indexed
-      // query, and it does nothing at all unless a case is both approved and
-      // due. The double-post interlock is a database constraint, not a
-      // function of how often this runs.
-      schedule: "* * * * *",
+        "At :00 and :30: find approved social_post cases whose publish_at is due and not yet published, then publish them. Approved plus due is the whole rule; the emergency pause records a dry run instead of sending.",
+      // Dubai has a fixed UTC+4 offset, so :00/:30 Dubai aligns with :00/:30
+      // UTC. Restricting UI and server writes to those slots lets this bounded,
+      // non-LLM job run twice an hour with no timing drift.
+      schedule: "0,30 * * * *",
     },
   ],
 
