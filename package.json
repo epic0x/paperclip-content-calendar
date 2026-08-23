@@ -23,7 +23,7 @@
     "dev": "node ./esbuild.config.mjs --watch",
     "typecheck": "tsc --noEmit",
     "verify:namespace": "node ./scripts/verify-namespace.mjs",
-    "test": "node --test test/"
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@paperclipai/plugin-sdk": "2026.821.0-canary.11"
