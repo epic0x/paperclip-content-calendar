@@ -28,6 +28,14 @@ type Post = {
   posted_at: string | null;
   post_url: string | null;
   error_message: string | null;
+  /** Absolute path to the image on the publishing host. NULL for text-only. */
+  media_path: string | null;
+  /** Accessibility alt text. Required by the DB when media_path is set. */
+  alt_text: string | null;
+  /** Platform media id returned at upload. Audit trail for what was sent. */
+  media_id: string | null;
+  /** Originating Paperclip case identifier, e.g. UNT-C96. */
+  source_ref: string | null;
   metadata: Record<string, unknown>;
   created_by: string | null;
   created_at: string;
@@ -70,32 +78,73 @@ function requireStr(value: unknown, name: string): string {
   return s;
 }
 
-async function runXPost(content: string): Promise<{ success: boolean; url: string | null; error: string | null }> {
+/**
+ * Publish one post to X, with optional media + alt text.
+ *
+ * Calls the host publish script, which owns the OAuth1 credentials and the
+ * v1.1 multipart media upload (X's v2 API has no upload endpoint). The script
+ * always emits a single JSON object on stdout, success or failure, so the
+ * result is parsed rather than scraped out of log text.
+ *
+ * The path is configurable because it differs per host; the previous
+ * hard-coded `/root/.openclaw/...` path only existed on one machine and made
+ * the plugin silently unusable everywhere else.
+ */
+async function runXPost(
+  content: string,
+  mediaPath?: string | null,
+  altText?: string | null,
+): Promise<{
+  success: boolean;
+  url: string | null;
+  mediaId: string | null;
+  error: string | null;
+}> {
   return new Promise((resolve) => {
-    const scriptPath = "/root/.openclaw/workspace/skills/x-api/scripts/x-post.mjs";
-    const child = spawn("node", [scriptPath, content], {
+    const scriptPath =
+      process.env.PAPERCLIP_X_PUBLISH_SCRIPT ??
+      `${process.env.HOME ?? ""}/.hermes/scripts/x_publish.py`;
+
+    const payload = JSON.stringify({
+      text: content,
+      media: mediaPath ?? null,
+      alt: altText ?? null,
+    });
+
+    const child = spawn("python3", [scriptPath, payload], {
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: 60000,
+      timeout: 180000,
     });
 
     let stdout = "";
     let stderr = "";
-
     child.stdout.on("data", (chunk: Buffer) => { stdout += String(chunk); });
     child.stderr.on("data", (chunk: Buffer) => { stderr += String(chunk); });
 
-    child.on("close", (code) => {
-      if (code === 0) {
-        // Try to extract URL from stdout
-        const urlMatch = stdout.match(/https:\/\/(?:twitter|x)\.com\/\S+/);
-        resolve({ success: true, url: urlMatch ? urlMatch[0] : null, error: null });
-      } else {
-        resolve({ success: false, url: null, error: stderr.trim() || stdout.trim() || `Exit code ${code}` });
+    child.on("close", () => {
+      try {
+        const line = stdout.trim().split("\n").filter(Boolean).pop() ?? "{}";
+        const r = JSON.parse(line) as {
+          ok?: boolean; url?: string; media_id?: string; error?: string;
+        };
+        resolve({
+          success: r.ok === true,
+          url: r.url ?? null,
+          mediaId: r.media_id ?? null,
+          error: r.ok === true ? null : (r.error ?? "unknown error"),
+        });
+      } catch {
+        resolve({
+          success: false,
+          url: null,
+          mediaId: null,
+          error: (stderr.trim() || stdout.trim() || "no output from publisher").slice(0, 500),
+        });
       }
     });
 
     child.on("error", (err) => {
-      resolve({ success: false, url: null, error: err.message });
+      resolve({ success: false, url: null, mediaId: null, error: err.message });
     });
   });
 }
@@ -392,6 +441,119 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
     };
   });
 
+  // import-cases — pull approved social_post cases into the calendar.
+  //
+  // This is what makes the calendar a VIEW rather than a second source of
+  // truth. Content is authored and approved as a Paperclip case; the calendar
+  // only ever mirrors what a human already approved there. `source_ref` carries
+  // the case identifier and is uniquely indexed, so re-running this updates in
+  // place instead of duplicating the week.
+  //
+  // Deliberately imports at status 'draft', never 'approved'. Approval in the
+  // case tracker is approval of the COPY. Approval to publish is a separate,
+  // explicit act in the calendar. Collapsing the two would mean approving a
+  // caption silently schedules a live post.
+  ctx.actions.register("import-cases", async (params) => {
+    const companyId = requireStr(params.companyId, "companyId");
+    const platform = strField(params.platform) ?? "x";
+
+    // Read cases over the host HTTP API rather than by SQL. `cases` is not an
+    // allowed coreReadTable, and going through the API is the right boundary
+    // regardless: it enforces the approval ladder and company access checks.
+    const baseUrl = process.env.PAPERCLIP_BASE_URL ?? "http://127.0.0.1:3100";
+    const apiToken = process.env.PAPERCLIP_API_TOKEN ?? "";
+    const res = await ctx.http.fetch(
+      `${baseUrl}/api/companies/${companyId}/cases?type=social_post&limit=200`,
+      { headers: apiToken ? { Authorization: `Bearer ${apiToken}` } : {} },
+    );
+    if (!res.ok) {
+      throw new Error(`cases API returned ${res.status}`);
+    }
+    const payload = (await res.json()) as unknown;
+    const rawCases = Array.isArray(payload)
+      ? payload
+      : ((payload as { cases?: unknown[]; data?: unknown[] }).cases
+         ?? (payload as { data?: unknown[] }).data
+         ?? []);
+
+    const cases = (rawCases as Array<Record<string, unknown>>).filter((c) => {
+      const s = strField(c.status);
+      return s === "approved" || s === "in_review";
+    });
+
+    const imported: Array<{ ref: string; date: string; action: string }> = [];
+    const skipped: Array<{ ref: string; reason: string }> = [];
+
+    for (const c of cases) {
+      const identifier = strField(c.identifier) ?? strField(c.key) ?? "unknown";
+      const f = (c.fields ?? {}) as Record<string, unknown>;
+      const content = strField(f.caption);
+      const publishAt = strField(f.publish_at);
+
+      if (!content) { skipped.push({ ref: identifier, reason: "no caption" }); continue; }
+      if (!publishAt) { skipped.push({ ref: identifier, reason: "no publish_at" }); continue; }
+      if (content.length > 280) {
+        skipped.push({ ref: identifier, reason: `caption ${content.length} chars > 280` });
+        continue;
+      }
+      const channel = strField(f.channel);
+      if (channel && channel !== platform) {
+        skipped.push({ ref: identifier, reason: `channel is ${channel}` });
+        continue;
+      }
+
+      // publish_at is an ISO instant; split into the date/time columns.
+      const [datePart, timePartRaw] = publishAt.split("T");
+      const timePart = timePartRaw ? timePartRaw.replace("Z", "").slice(0, 8) : null;
+
+      const mediaPath = strField(f.media_path) ?? strField(f.media_file);
+      const altText = strField(f.alt_text);
+
+      // The DB enforces this too; failing here gives a readable reason.
+      if (mediaPath && !altText) {
+        skipped.push({ ref: identifier, reason: "media without alt text" });
+        continue;
+      }
+
+      const rows = await ctx.db.query<{ id: string; inserted: boolean }>(
+        `INSERT INTO ${postsTable(ctx.db.namespace)}
+           (company_id, platform, content, scheduled_date, scheduled_time,
+            status, media_path, alt_text, source_ref)
+         VALUES ($1, $2, $3, $4, $5, 'draft', $6, $7, $8)
+         ON CONFLICT (source_ref) WHERE source_ref IS NOT NULL
+         DO UPDATE SET content        = EXCLUDED.content,
+                       scheduled_date = EXCLUDED.scheduled_date,
+                       scheduled_time = EXCLUDED.scheduled_time,
+                       media_path     = EXCLUDED.media_path,
+                       alt_text       = EXCLUDED.alt_text,
+                       updated_at     = NOW()
+         -- never silently re-open something already sent
+         WHERE ${postsTable(ctx.db.namespace)}.status <> 'posted'
+         RETURNING id, (xmax = 0) AS inserted`,
+        [companyId, platform, content, datePart, timePart,
+         mediaPath, altText, identifier],
+      );
+
+      const row = rows[0];
+      if (!row) { skipped.push({ ref: identifier, reason: "already posted" }); continue; }
+      imported.push({
+        ref: identifier,
+        date: datePart,
+        action: row.inserted ? "created" : "updated",
+      });
+    }
+
+    await ctx.activity.log({
+      companyId,
+      entityType: "post",
+      entityId: companyId,
+      message: `Imported ${imported.length} case(s) into the calendar, skipped ${skipped.length}`,
+      metadata: { plugin: PLUGIN_ID, imported, skipped },
+    });
+
+    return { imported, skipped, importedCount: imported.length, skippedCount: skipped.length };
+  });
+
   // create-post — create a single post manually
   ctx.actions.register("create-post", async (params) => {
     const companyId = requireStr(params.companyId, "companyId");
@@ -447,13 +609,28 @@ async function registerJobs(ctx: PluginContext): Promise<void> {
     for (const company of companies) {
       const companyId = company.id;
 
-      // Find approved posts scheduled for today
+      // Approved posts that are actually DUE.
+      //
+      // The original query matched `scheduled_date = CURRENT_DATE` and ignored
+      // scheduled_time completely, so a post set for 14:00 published whenever
+      // the job happened to run — 06:00, 23:00, whenever. For a calendar whose
+      // entire value is "post at the right time", that is a correctness bug,
+      // not a nicety. A NULL time still means "any time today".
+      //
+      // Overdue posts from previous days are deliberately included: if the job
+      // was down, an approved post should still go out rather than vanish.
       const todayPosts = await ctx.db.query<Post>(
-        `SELECT id, content, platform
+        `SELECT id, content, platform, media_path, alt_text
          FROM ${postsTable(ctx.db.namespace)}
          WHERE company_id = $1
            AND status = 'approved'
-           AND scheduled_date = CURRENT_DATE`,
+           AND (
+                 scheduled_date < CURRENT_DATE
+                 OR (scheduled_date = CURRENT_DATE
+                     AND (scheduled_time IS NULL
+                          OR scheduled_time <= CURRENT_TIME))
+               )
+         ORDER BY scheduled_date ASC, scheduled_time ASC NULLS FIRST`,
         [companyId],
       );
 
@@ -461,14 +638,15 @@ async function registerJobs(ctx: PluginContext): Promise<void> {
 
       for (const post of todayPosts) {
         try {
-          const result = await runXPost(post.content);
+          const result = await runXPost(post.content, post.media_path, post.alt_text);
 
           if (result.success) {
             await ctx.db.execute(
               `UPDATE ${postsTable(ctx.db.namespace)}
-               SET status = 'posted', posted_at = NOW(), post_url = $2, updated_at = NOW()
+               SET status = 'posted', posted_at = NOW(), post_url = $2,
+                   media_id = $3, error_message = NULL, updated_at = NOW()
                WHERE id = $1`,
-              [post.id, result.url],
+              [post.id, result.url, result.mediaId],
             );
 
             results.push({ companyId, postId: post.id, status: "posted" });
@@ -503,14 +681,18 @@ async function registerJobs(ctx: PluginContext): Promise<void> {
 
     ctx.logger.info(`[content-calendar] Daily post check complete: ${posted} posted, ${failed} failed`);
 
-    return {
-      jobKey: job.jobKey,
-      runId: job.runId,
-      posted,
-      failed,
-      results,
-      completedAt: new Date().toISOString(),
-    };
+    // Job handlers must resolve void. The previous return value was silently
+    // discarded by the runtime and made the whole registration fail to
+    // typecheck, so the outcome is logged and recorded as a metric instead —
+    // which is where an operator would actually look for it.
+    await ctx.metrics.write("content_calendar.job_posted", posted);
+    await ctx.metrics.write("content_calendar.job_failed", failed);
+    if (failed > 0) {
+      ctx.logger.error(`[content-calendar] ${failed} post(s) failed`, {
+        runId: job.runId,
+        failures: results.filter((r) => r.status === "failed"),
+      });
+    }
   });
 }
 
