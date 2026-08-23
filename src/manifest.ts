@@ -62,6 +62,11 @@ const manifest: PaperclipPluginManifestV1 = {
   database: {
     namespaceSlug: "content_calendar",
     migrationsDir: "migrations",
+    // NOTE: `cases` is deliberately absent. The SDK's coreReadTables union does
+    // not include it (verified against @paperclipai/plugin-sdk 2026.817.0), so
+    // the plugin cannot read the cases table directly. import-cases therefore
+    // goes through the host HTTP API instead, which is the correct boundary
+    // anyway: the API enforces the approval ladder, raw SQL would not.
     coreReadTables: ["companies", "issues", "projects"],
   },
   projects: [

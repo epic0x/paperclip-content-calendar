@@ -18,13 +18,13 @@
     "ui": "./dist/ui/"
   },
   "scripts": {
-    "prebuild": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps",
+    "prebuild": "echo standalone build",
     "build": "node ./esbuild.config.mjs",
     "dev": "node ./esbuild.config.mjs --watch",
-    "typecheck": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@paperclipai/plugin-sdk": "workspace:*",
+    "@paperclipai/plugin-sdk": "^2026.817.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {

@@ -254,8 +254,13 @@ export function CalendarView({ companyId }: { companyId: string }) {
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
 
-  const calendarData = usePluginData<CalendarData>("calendar", { companyId, days: 10 }, [refreshKey]);
-  const statsData = usePluginData<PostStats>("stats", { companyId }, [refreshKey]);
+  // `usePluginData(key, params)` takes no deps array — the third argument was
+  // silently ignored by TypeScript's overload resolution and the refresh never
+  // fired, so approving a post left the grid stale until a full page reload.
+  // Folding refreshKey into params makes it part of the query identity, which
+  // is what actually re-runs the fetch.
+  const calendarData = usePluginData<CalendarData>("calendar", { companyId, days: 10, refreshKey });
+  const statsData = usePluginData<PostStats>("stats", { companyId, refreshKey });
   const generateBatch = usePluginAction("generate-batch");
   const approvePost = usePluginAction("approve-post");
   const unapprovePost = usePluginAction("unapprove-post");

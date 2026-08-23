@@ -20,7 +20,12 @@ export function ContentCalendarPage({ context }: PluginPageProps) {
         color: "var(--foreground, oklch(0.985 0 0))",
       }}
     >
-      <CalendarView companyId={context.companyId} />
+      {/* companyId is nullable in the host context (e.g. a global page with no
+          company selected). Render a message rather than passing null into a
+          component that requires a string. */}
+      {context.companyId
+        ? <CalendarView companyId={context.companyId} />
+        : <p style={{ opacity: 0.7 }}>Select a company to view its content calendar.</p>}
     </div>
   );
 }
