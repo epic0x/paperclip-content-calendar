@@ -42,6 +42,31 @@ jobs:
           done
           test -s migrations/001_publish_log.sql
 
+      - name: Verify the worker resolves with NO node_modules
+        # `paperclipai plugin install` copies built output only — the installed
+        # plugin directory has no node_modules. Anything left external at
+        # bundle time therefore dies at worker startup with ERR_MODULE_NOT_FOUND
+        # and aborts the install. This reproduces that exact condition: copy
+        # dist/ somewhere clean and import it.
+        #
+        # react/react-dom are legitimately host-provided and are the only
+        # permitted externals.
+        run: |
+          set -eu
+          rm -rf /tmp/isolated && mkdir -p /tmp/isolated
+          cp -r dist /tmp/isolated/
+          cd /tmp/isolated
+          echo '{"type":"module"}' > package.json
+          bare=$(grep -oE 'from"[^"./][^"]*"' dist/worker.js | sed 's/from"//;s/"$//' | sort -u || true)
+          echo "bare imports in worker bundle: ${bare:-none}"
+          for m in $bare; do
+            case "$m" in
+              react|react-dom|react/*|node:*) ;;
+              *) echo "FAIL: worker bundle expects '$m' at runtime, but the installed plugin has no node_modules."; exit 1 ;;
+            esac
+          done
+          node --input-type=module -e 'await import("/tmp/isolated/dist/manifest.js"); console.log("manifest.js imports cleanly with no node_modules");'
+
       - name: Verify the migration namespace matches the derived one
         # The host derives plugin_<slug>_<sha256(pluginId)[0:10]>. If the
         # migration SQL hardcodes a different schema, every statement is

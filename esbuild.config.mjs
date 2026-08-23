@@ -4,11 +4,20 @@ import { createPluginBundlerPresets } from "@paperclipai/plugin-sdk/bundlers";
 const presets = createPluginBundlerPresets({ uiEntry: "src/ui/index.tsx" });
 const watch = process.argv.includes("--watch");
 
-// `zod` is a transitive dep of @paperclipai/shared and must stay external.
-const workerOptions = {
-  ...presets.esbuild.worker,
-  external: [...(presets.esbuild.worker.external ?? []), "zod"],
-};
+/**
+ * Use the SDK worker preset as-is.
+ *
+ * The June scaffold added `zod` to `external`, inherited from a monorepo setup
+ * where node_modules was on disk beside the plugin. The installed artifact has
+ * NO node_modules — `paperclipai plugin install` copies built output only — so
+ * anything left external fails at worker startup with
+ *   ERR_MODULE_NOT_FOUND: Cannot find package 'zod'
+ * and the install aborts with "Worker initialize failed".
+ *
+ * The SDK preset externalises exactly react and react-dom, which the host
+ * provides. Everything else must be bundled. Do not add to this list.
+ */
+const workerOptions = presets.esbuild.worker;
 
 /**
  * The publish gate is also emitted as its own ESM file.
