@@ -12,7 +12,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
  * migration statement. If you must change them, recompute the namespace first.
  */
 export const PLUGIN_ID = "untrace.plugin-content-calendar";
-export const PLUGIN_VERSION = "0.2.0";
+export const PLUGIN_VERSION = "0.2.1";
 export const NAMESPACE_SLUG = "content_calendar";
 export const DB_NAMESPACE = "plugin_content_calendar_cc002f61cd";
 

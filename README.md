@@ -161,8 +161,9 @@ disagrees with the compiled constant.
   `403 Cases are disabled` means an operator turned it off.
 - **`POST /cases` upserts on `(caseType, key)`** — `200` updates, `201`
   creates. Retries converge only with a deterministic key.
-- **The calendar grid is UTC.** `publish_at` is an instant; rendering in
-  browser-local time would shift posts across day boundaries for anyone outside
-  UTC.
+- **The calendar displays and accepts Asia/Dubai time (UTC+4).** `publish_at`
+  remains a UTC instant in storage. Both the worker's day grouping and the UI's
+  Today marker, labels, input value, and save conversion use the same Dubai
+  helper module, so posts around midnight stay on the correct local date.
 - **Plugin UI is same-origin, not sandboxed.** Fine for a plugin we wrote;
   a reason not to install third-party plugins casually.

@@ -1,5 +1,13 @@
 import { useMemo, useState } from "react";
 import { usePluginAction, usePluginData } from "@paperclipai/plugin-sdk/ui";
+import {
+  dubaiDayKey,
+  dubaiLocalToIso,
+  dubaiMonth,
+  dubaiTime,
+  dubaiYear,
+  isoToDubaiLocalInput,
+} from "../time.js";
 
 // ---------------------------------------------------------------------------
 // Types mirroring what the worker's data handlers return
@@ -43,9 +51,8 @@ interface CalendarData {
 }
 
 // ---------------------------------------------------------------------------
-// Date helpers — the grid is UTC, deliberately. publish_at is stored as an
-// instant, and rendering it in browser-local time would silently shift a post
-// into the previous or next day for anyone outside UTC.
+// Calendar coordinates are synthetic UTC dates, but all real instants are
+// displayed and edited in Asia/Dubai. publish_at remains a UTC instant.
 // ---------------------------------------------------------------------------
 
 const DAY_MS = 86_400_000;
@@ -70,7 +77,7 @@ function monthGrid(year: number, month: number): string[] {
 
 function timeOf(iso: string | null): string {
   if (!iso) return "";
-  return new Date(iso).toISOString().slice(11, 16) + "Z";
+  return dubaiTime(iso);
 }
 
 const MONTHS = [
@@ -228,7 +235,7 @@ function DetailPanel({
   postResult: { ok: boolean; text: string } | null;
 }) {
   const [when, setWhen] = useState(
-    entry.publishAt ? entry.publishAt.slice(0, 16) : "",
+    entry.publishAt ? isoToDubaiLocalInput(entry.publishAt) : "",
   );
   const [confirmPost, setConfirmPost] = useState(false);
 
@@ -468,7 +475,7 @@ function DetailPanel({
       {/* ---- Schedule ---- */}
       <div style={{ marginTop: 18, borderTop: "1px solid #27272a", paddingTop: 16 }}>
         <label style={{ fontSize: 11, color: "#a1a1aa", display: "block", marginBottom: 6 }}>
-          Publish at (UTC)
+          Publish at (Dubai, UTC+4)
         </label>
         <div style={{ display: "flex", gap: 8 }}>
           <input
@@ -488,7 +495,7 @@ function DetailPanel({
           <button
             type="button"
             disabled={busy !== null || !when}
-            onClick={() => onReschedule(`${when}:00Z`)}
+            onClick={() => onReschedule(dubaiLocalToIso(when))}
             style={{
               background: busy ? "#3f3f46" : "#2563eb",
               border: "none",
@@ -513,8 +520,8 @@ function DetailPanel({
 
 export function CalendarView({ companyId }: { companyId: string | null }) {
   const today = new Date();
-  const [year, setYear] = useState(today.getUTCFullYear());
-  const [month, setMonth] = useState(today.getUTCMonth());
+  const [year, setYear] = useState(dubaiYear(today));
+  const [month, setMonth] = useState(dubaiMonth(today));
   const [selected, setSelected] = useState<CalendarEntry | null>(null);
   const [channelFilter, setChannelFilter] = useState<string>("all");
   const [busy, setBusy] = useState<string | null>(null);
@@ -670,8 +677,8 @@ export function CalendarView({ companyId }: { companyId: string | null }) {
           <NavButton
             onClick={() => {
               const n = new Date();
-              setYear(n.getUTCFullYear());
-              setMonth(n.getUTCMonth());
+              setYear(dubaiYear(n));
+              setMonth(dubaiMonth(n));
             }}
           >
             Today
@@ -732,7 +739,7 @@ export function CalendarView({ companyId }: { companyId: string | null }) {
 
         {grid.map((date) => {
           const inMonth = Number(date.slice(5, 7)) === month + 1;
-          const isToday = date === ymd(new Date());
+          const isToday = date === dubaiDayKey(new Date());
           const entries = byDay.get(date) ?? [];
           return (
             <div

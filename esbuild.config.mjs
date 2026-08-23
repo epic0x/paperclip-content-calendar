@@ -39,16 +39,28 @@ const gateOptions = {
   logLevel: "info",
 };
 
+const timeOptions = {
+  entryPoints: ["src/time.ts"],
+  outfile: "dist/time.js",
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: ["node22"],
+  sourcemap: true,
+  logLevel: "info",
+};
+
 const contexts = await Promise.all([
   esbuild.context(workerOptions),
   esbuild.context(presets.esbuild.manifest),
   esbuild.context(presets.esbuild.ui),
   esbuild.context(gateOptions),
+  esbuild.context(timeOptions),
 ]);
 
 if (watch) {
   await Promise.all(contexts.map((c) => c.watch()));
-  console.log("esbuild watch mode enabled for worker, manifest, ui, gate");
+  console.log("esbuild watch mode enabled for worker, manifest, ui, gate, time");
 } else {
   await Promise.all(contexts.map((c) => c.rebuild()));
   await Promise.all(contexts.map((c) => c.dispose()));

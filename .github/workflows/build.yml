@@ -36,7 +36,7 @@ jobs:
       - name: Verify build output
         run: |
           set -eu
-          for f in dist/manifest.js dist/worker.js dist/ui/index.js dist/gate.js; do
+          for f in dist/manifest.js dist/worker.js dist/ui/index.js dist/gate.js dist/time.js; do
             test -s "$f" || { echo "MISSING OR EMPTY: $f"; exit 1; }
             echo "ok: $f ($(wc -c < "$f") bytes)"
           done

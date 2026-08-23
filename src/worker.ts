@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { dubaiDayKey } from "./time.js";
 import {
   definePlugin,
   runWorker,
@@ -38,10 +39,6 @@ function requireStr(v: unknown, name: string): string {
   return v.trim();
 }
 
-/** YYYY-MM-DD in UTC. The calendar grid is UTC; channel-local time is a later concern. */
-function dayKey(iso: string): string {
-  return new Date(iso).toISOString().slice(0, 10);
-}
 
 async function sentCaseIds(
   ctx: PluginContext,
@@ -131,7 +128,7 @@ async function registerDataHandlers(ctx: PluginContext): Promise<void> {
 
     const byDay = new Map<string, CalendarEntry[]>();
     for (const e of scheduled) {
-      const day = dayKey(e.publishAt as string);
+      const day = dubaiDayKey(e.publishAt as string);
       if (from && day < from) continue;
       if (to && day > to) continue;
       const list = byDay.get(day) ?? [];
