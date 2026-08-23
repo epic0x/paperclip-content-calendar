@@ -5,6 +5,8 @@ import { usePluginAction, usePluginData } from "@paperclipai/plugin-sdk/ui";
 // Types mirroring what the worker's data handlers return
 // ---------------------------------------------------------------------------
 
+export type CaseLifecycle = "draft" | "in_review" | "approved" | "cancelled";
+
 export interface CalendarEntry {
   id: string;
   identifier: string;
@@ -140,97 +142,71 @@ function Stat({ label, value, tone }: { label: string; value: number; tone?: str
   );
 }
 
+/**
+ * A post on the month grid.
+ *
+ * Deliberately NOT interactive beyond opening the post (JC, 2026-08-23: "Don't
+ * put those controls outside as clickable items in the calendar — only keep it
+ * inside."). A grid of small buttons is where a mis-click publishes something.
+ * The chip shows state; the panel changes it.
+ */
 function EntryChip({
   entry,
   onSelect,
-  onQuickApprove,
-  busy,
 }: {
   entry: CalendarEntry;
   onSelect: (e: CalendarEntry) => void;
-  onQuickApprove: (e: CalendarEntry) => void;
-  busy: boolean;
 }) {
-  const canQuickApprove =
-    !entry.approved &&
-    !entry.publishUrl &&
-    entry.status !== "cancelled" &&
-    entry.status !== "done";
-
+  const s = STATUS_STYLE[entry.status] ?? STATUS_STYLE.draft;
   return (
-    <div
+    <button
+      type="button"
+      onClick={() => onSelect(entry)}
+      title={`${entry.identifier} — ${entry.title} (${s.label})`}
       style={{
         display: "flex",
-        alignItems: "stretch",
-        gap: 2,
+        alignItems: "center",
+        gap: 5,
+        width: "100%",
+        textAlign: "left",
+        background: entry.publishUrl ? "#14432a" : "#27272a",
+        border: "none",
+        borderLeft: `3px solid ${channelColor(entry.channel)}`,
+        borderRadius: 3,
+        padding: "3px 5px",
         marginBottom: 2,
+        cursor: "pointer",
+        color: "#e4e4e7",
+        fontSize: 11,
+        overflow: "hidden",
       }}
     >
-      <button
-        type="button"
-        onClick={() => onSelect(entry)}
-        title={`${entry.identifier} — ${entry.title}`}
+      {/* Status is a colour dot, not a control. */}
+      <span
+        aria-hidden
         style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 5,
-          flex: 1,
-          minWidth: 0,
-          textAlign: "left",
-          background: entry.publishUrl ? "#14432a" : "#27272a",
-          border: "none",
-          borderLeft: `3px solid ${channelColor(entry.channel)}`,
-          borderRadius: 3,
-          padding: "3px 5px",
-          cursor: "pointer",
-          color: "#e4e4e7",
-          fontSize: 11,
+          width: 6,
+          height: 6,
+          borderRadius: "50%",
+          background: s.fg,
+          flexShrink: 0,
+        }}
+      />
+      <span style={{ color: "#a1a1aa", fontVariantNumeric: "tabular-nums" }}>
+        {timeOf(entry.publishAt)}
+      </span>
+      <span
+        style={{
           overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          flex: 1,
         }}
       >
-        <span style={{ color: "#a1a1aa", fontVariantNumeric: "tabular-nums" }}>
-          {timeOf(entry.publishAt)}
-        </span>
-        <span
-          style={{
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            flex: 1,
-          }}
-        >
-          {entry.title}
-        </span>
-        {entry.approved && <span style={{ color: "#4ade80" }}>✓</span>}
-        {entry.publishUrl && <span style={{ color: "#4ade80" }}>↗</span>}
-      </button>
-
-      {canQuickApprove && (
-        <button
-          type="button"
-          disabled={busy}
-          title="Approve this post"
-          onClick={(e) => {
-            e.stopPropagation();
-            onQuickApprove(entry);
-          }}
-          style={{
-            background: "#166534",
-            border: "none",
-            borderRadius: 3,
-            color: "#fff",
-            fontSize: 10,
-            lineHeight: 1,
-            padding: "0 6px",
-            cursor: busy ? "default" : "pointer",
-            opacity: busy ? 0.5 : 1,
-            flexShrink: 0,
-          }}
-        >
-          ✓
-        </button>
-      )}
-    </div>
+        {entry.title}
+      </span>
+      {entry.publishUrl && <span style={{ color: "#4ade80" }}>↗</span>}
+    </button>
   );
 }
 
@@ -246,7 +222,7 @@ function DetailPanel({
   entry: CalendarEntry;
   onClose: () => void;
   onReschedule: (iso: string) => void;
-  onSetStatus: (status: "approved" | "in_review") => void;
+  onSetStatus: (status: CaseLifecycle) => void;
   onPostNow: () => void;
   busy: string | null;
   postResult: { ok: boolean; text: string } | null;
@@ -257,7 +233,6 @@ function DetailPanel({
   const [confirmPost, setConfirmPost] = useState(false);
 
   const alreadyPublished = Boolean(entry.publishUrl);
-  const terminal = entry.status === "cancelled" || entry.status === "done";
 
   return (
     <div
@@ -345,87 +320,89 @@ function DetailPanel({
         </p>
       )}
 
-      {/* ---- Approval: writes the native case status ---- */}
-      {!terminal && (
-        <div style={{ marginTop: 20, borderTop: "1px solid #27272a", paddingTop: 16 }}>
-          <label style={{ fontSize: 11, color: "#a1a1aa", display: "block", marginBottom: 8 }}>
-            Approval
-          </label>
-          {entry.approved ? (
-            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <span style={{ color: "#4ade80", fontSize: 13 }}>✓ Approved</span>
+      {/* ---- Status: the full lifecycle, changed from inside the post ---- */}
+      <div style={{ marginTop: 20, borderTop: "1px solid #27272a", paddingTop: 16 }}>
+        <label style={{ fontSize: 11, color: "#a1a1aa", display: "block", marginBottom: 8 }}>
+          Status
+        </label>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {(["draft", "in_review", "approved", "cancelled"] as const).map((s) => {
+            const style = STATUS_STYLE[s];
+            const active = entry.status === s;
+            return (
               <button
+                key={s}
                 type="button"
-                disabled={busy !== null}
-                onClick={() => onSetStatus("in_review")}
+                disabled={busy !== null || active}
+                onClick={() => onSetStatus(s)}
                 style={{
-                  background: "transparent",
-                  border: "1px solid #3f3f46",
+                  background: active ? style.bg : "transparent",
+                  border: `1px solid ${active ? style.fg : "#3f3f46"}`,
                   borderRadius: 6,
-                  color: "#a1a1aa",
-                  padding: "4px 10px",
-                  fontSize: 11,
-                  cursor: busy ? "default" : "pointer",
+                  color: active ? style.fg : "#a1a1aa",
+                  padding: "5px 12px",
+                  fontSize: 12,
+                  fontWeight: active ? 600 : 400,
+                  cursor: active || busy ? "default" : "pointer",
+                  opacity: busy && !active ? 0.5 : 1,
                 }}
               >
-                {busy === "status" ? "Saving…" : "Move back to review"}
+                {active && "● "}
+                {style.label}
               </button>
-            </div>
-          ) : (
-            <button
-              type="button"
-              disabled={busy !== null}
-              onClick={() => onSetStatus("approved")}
-              style={{
-                background: busy ? "#3f3f46" : "#15803d",
-                border: "none",
-                borderRadius: 6,
-                color: "#fff",
-                padding: "7px 16px",
-                fontSize: 13,
-                fontWeight: 600,
-                cursor: busy ? "default" : "pointer",
-              }}
-            >
-              {busy === "status" ? "Approving…" : "✓ Approve"}
-            </button>
-          )}
-          <p style={{ fontSize: 11, color: "#71717a", marginTop: 8, lineHeight: 1.5 }}>
-            This sets the case status in Paperclip — the same field the case page
-            writes, and it is logged the same way.
-          </p>
+            );
+          })}
         </div>
-      )}
+        {busy === "status" && (
+          <p style={{ fontSize: 11, color: "#a1a1aa", marginTop: 8 }}>Saving…</p>
+        )}
+        <p style={{ fontSize: 11, color: "#71717a", marginTop: 8, lineHeight: 1.5 }}>
+          This is the case status in Paperclip — the same field the case page
+          writes, logged the same way.{" "}
+          <strong style={{ color: "#4ade80" }}>Approved</strong> plus a publish
+          date in the past is all it takes to go out.
+        </p>
+      </div>
 
       {/* ---- Post Now ---- */}
-      {!terminal && !alreadyPublished && (
+      {!alreadyPublished && (
         <div style={{ marginTop: 18, borderTop: "1px solid #27272a", paddingTop: 16 }}>
           <label style={{ fontSize: 11, color: "#a1a1aa", display: "block", marginBottom: 8 }}>
             Publish
           </label>
 
-          {!entry.approved ? (
+          {entry.status === "cancelled" || entry.status === "done" ? (
             <p style={{ fontSize: 12, color: "#71717a", margin: 0, lineHeight: 1.5 }}>
-              Approve first. Posting is blocked until the case is approved.
+              A {entry.status} post cannot be published.
+            </p>
+          ) : !entry.approved ? (
+            <p style={{ fontSize: 12, color: "#71717a", margin: 0, lineHeight: 1.5 }}>
+              Set the status to Approved first. Posting is blocked until then.
             </p>
           ) : !confirmPost ? (
-            <button
-              type="button"
-              disabled={busy !== null}
-              onClick={() => setConfirmPost(true)}
-              style={{
-                background: "#1d4ed8",
-                border: "none",
-                borderRadius: 6,
-                color: "#fff",
-                padding: "7px 16px",
-                fontSize: 13,
-                fontWeight: 600,
-                cursor: busy ? "default" : "pointer",
-              }}
-            >
-              Post now
-            </button>
+            <div>
+              <button
+                type="button"
+                disabled={busy !== null}
+                onClick={() => setConfirmPost(true)}
+                style={{
+                  background: "#1d4ed8",
+                  border: "none",
+                  borderRadius: 6,
+                  color: "#fff",
+                  padding: "7px 16px",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: busy ? "default" : "pointer",
+                }}
+              >
+                Post now
+              </button>
+              <p style={{ fontSize: 11, color: "#71717a", marginTop: 8, lineHeight: 1.5 }}>
+                Only needed to skip the schedule. Otherwise this goes out on its
+                own at {entry.publishAt ? timeOf(entry.publishAt) : "its publish date"}.
+              </p>
+            </div>
           ) : (
             <div>
               <p style={{ fontSize: 12, color: "#fbbf24", margin: "0 0 10px", lineHeight: 1.5 }}>
@@ -626,7 +603,7 @@ export function CalendarView({ companyId }: { companyId: string | null }) {
     }
   };
 
-  const onSetStatus = async (status: "approved" | "in_review") => {
+  const onSetStatus = async (status: CaseLifecycle) => {
     if (!selected) return;
     setBusy("status");
     setPostResult(null);
@@ -645,27 +622,6 @@ export function CalendarView({ companyId }: { companyId: string | null }) {
       setPostResult({
         ok: false,
         text: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  /** One-click approve straight from a calendar chip, no panel needed. */
-  const onQuickApprove = async (entry: CalendarEntry) => {
-    setBusy("status");
-    try {
-      await setStatus({
-        companyId,
-        caseId: entry.id,
-        caseIdentifier: entry.identifier,
-        status: "approved",
-      });
-      refresh();
-    } catch (err) {
-      setPostResult({
-        ok: false,
-        text: `${entry.identifier}: ${err instanceof Error ? err.message : String(err)}`,
       });
     } finally {
       setBusy(null);
@@ -803,13 +759,7 @@ export function CalendarView({ companyId }: { companyId: string | null }) {
                 {Number(date.slice(8, 10))}
               </div>
               {entries.map((e) => (
-                <EntryChip
-                  key={e.id}
-                  entry={e}
-                  onSelect={setSelected}
-                  onQuickApprove={onQuickApprove}
-                  busy={busy !== null}
-                />
+                <EntryChip key={e.id} entry={e} onSelect={setSelected} />
               ))}
             </div>
           );

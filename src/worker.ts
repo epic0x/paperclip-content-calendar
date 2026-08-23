@@ -197,7 +197,7 @@ async function registerDataHandlers(ctx: PluginContext): Promise<void> {
       pluginId: PLUGIN_ID,
       apiBaseUrl: cfg.apiBaseUrl,
       boardKeyConfigured: Boolean(cfg.boardApiKeyRef),
-      autoPost: cfg.autoPost,
+      paused: cfg.paused,
       lookbackHours: cfg.lookbackHours,
       channels,
     };
@@ -273,7 +273,7 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
     const identifier = requireStr(params.caseIdentifier, "caseIdentifier");
     const status = requireStr(params.status, "status");
 
-    const ALLOWED = new Set(["approved", "in_review"]);
+    const ALLOWED = new Set(["draft", "in_review", "approved", "cancelled"]);
     if (!ALLOWED.has(status)) {
       throw new Error(
         `status "${status}" is not settable from the calendar; allowed: ${[...ALLOWED].join(", ")}`,
@@ -310,10 +310,10 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
   /**
    * post-now — publish one case immediately.
    *
-   * Runs the same gate as the scheduled job with `manual: true`, which
-   * substitutes for the autoPost switch and ignores the schedule. Every other
-   * protection still applies: approval, double-post, caption, channel and
-   * adapter checks all block exactly as they do on the cron path.
+   * Runs the same gate as the scheduled job with `manual: true`, which ignores
+   * the schedule because choosing the moment is the point. Every other
+   * protection still applies: approval, double-post, caption, channel, adapter
+   * and the emergency pause all block exactly as they do on the cron path.
    */
   ctx.actions.register("post-now", async (params, actionContext) => {
     const companyId = requireStr(params.companyId, "companyId");
@@ -335,7 +335,7 @@ interface SweepSummary {
   dryRun: number;
   failed: number;
   skipped: number;
-  autoPost: boolean;
+  paused: boolean;
   details: Array<{ case: string; outcome: string; reason: string }>;
 }
 
@@ -366,11 +366,11 @@ async function attemptOne(
   const decision = evaluate({
     entry,
     now: opts.now,
-    autoPost: cfg.autoPost,
     enabledChannels: cfg.channels.map((c) => c.toLowerCase()),
     lookbackHours: cfg.lookbackHours,
     alreadySent: opts.alreadySent,
     adapterReady,
+    paused: cfg.paused,
     manual: opts.manual,
   });
 
@@ -385,7 +385,7 @@ async function attemptOne(
       outcome: "dry_run",
       reason: decision.reason,
       postUrl: null,
-      raw: { autoPost: false, manual: opts.manual },
+      raw: { paused: true, manual: opts.manual },
     });
     return { outcome: "dry_run", reason: decision.reason, url: null };
   }
@@ -504,7 +504,7 @@ async function publishSweep(
     dryRun: 0,
     failed: 0,
     skipped: 0,
-    autoPost: cfg.autoPost,
+    paused: cfg.paused,
     details: [],
   };
 
@@ -550,7 +550,7 @@ async function publishSweep(
   }
 
   ctx.logger.info(
-    `[content-calendar] sweep(${trigger}) company=${companyId} evaluated=${summary.evaluated} sent=${summary.published} dry_run=${summary.dryRun} failed=${summary.failed} skipped=${summary.skipped} autoPost=${cfg.autoPost}`,
+    `[content-calendar] sweep(${trigger}) company=${companyId} evaluated=${summary.evaluated} sent=${summary.published} dry_run=${summary.dryRun} failed=${summary.failed} skipped=${summary.skipped} paused=${cfg.paused}`,
   );
   return summary;
 }

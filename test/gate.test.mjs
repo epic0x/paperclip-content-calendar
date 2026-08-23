@@ -28,11 +28,11 @@ const base = {
 const input = (entryOverrides = {}, overrides = {}) => ({
   entry: { ...base, ...entryOverrides },
   now: NOW,
-  autoPost: true,
   enabledChannels: ["x"],
   lookbackHours: 6,
   alreadySent: false,
   adapterReady: true,
+  paused: false,
   ...overrides,
 });
 
@@ -40,10 +40,22 @@ test("publishes an approved, due, enabled case", () => {
   assert.equal(evaluate(input()).outcome, "publish");
 });
 
-test("autoPost off downgrades to dry_run", () => {
-  const d = evaluate(input({}, { autoPost: false }));
+test("approved + due publishes with no extra switch — that is the whole rule", () => {
+  const d = evaluate(input());
+  assert.equal(d.outcome, "publish");
+  assert.equal(d.reason, "approved and due");
+});
+
+test("the emergency pause downgrades a due post to dry_run", () => {
+  const d = evaluate(input({}, { paused: true }));
   assert.equal(d.outcome, "dry_run");
-  assert.match(d.reason, /autoPost is off/);
+  assert.match(d.reason, /paused instance-wide/);
+});
+
+test("the emergency pause also stops Post Now — a stop a button can walk past is not a stop", () => {
+  const d = evaluate(input({}, { paused: true, manual: true }));
+  assert.equal(d.outcome, "dry_run");
+  assert.match(d.reason, /paused instance-wide/);
 });
 
 test("never sends twice", () => {
@@ -112,9 +124,7 @@ test("an unparseable publish_at is skipped, never thrown", () => {
 });
 
 test("already-sent beats every other condition", () => {
-  const d = evaluate(
-    input({ status: "approved" }, { alreadySent: true, autoPost: true }),
-  );
+  const d = evaluate(input({ status: "approved" }, { alreadySent: true }));
   assert.equal(d.reason, "already published");
 });
 
@@ -124,34 +134,34 @@ test("already-sent beats every other condition", () => {
 // and cannot override.
 // ---------------------------------------------------------------------------
 
-test("manual publishes with autoPost OFF — that is the point of the button", () => {
-  const d = evaluate(input({}, { autoPost: false, manual: true }));
+test("manual publishes and is attributed as manual", () => {
+  const d = evaluate(input({}, { manual: true }));
   assert.equal(d.outcome, "publish");
   assert.match(d.reason, /manually/);
 });
 
 test("manual ignores the schedule: a future post can be sent now", () => {
   const d = evaluate(
-    input({ publishAt: "2027-01-01T00:00:00Z" }, { autoPost: false, manual: true }),
+    input({ publishAt: "2027-01-01T00:00:00Z" }, { manual: true }),
   );
   assert.equal(d.outcome, "publish");
 });
 
 test("manual ignores the catch-up window: a stale post can be sent now", () => {
   const d = evaluate(
-    input({ publishAt: "2026-01-01T00:00:00Z" }, { autoPost: false, manual: true }),
+    input({ publishAt: "2026-01-01T00:00:00Z" }, { manual: true }),
   );
   assert.equal(d.outcome, "publish");
 });
 
 test("manual works on a case with NO publish_at at all", () => {
-  const d = evaluate(input({ publishAt: null }, { autoPost: false, manual: true }));
+  const d = evaluate(input({ publishAt: null }, { manual: true }));
   assert.equal(d.outcome, "publish");
 });
 
 test("manual CANNOT publish an unapproved case", () => {
   const d = evaluate(
-    input({ status: "in_review", approved: false }, { manual: true, autoPost: true }),
+    input({ status: "in_review", approved: false }, { manual: true }),
   );
   assert.equal(d.outcome, "skipped");
   assert.match(d.reason, /needs "approved"/);
@@ -192,7 +202,13 @@ test("manual CANNOT publish through an unconfigured adapter", () => {
   assert.match(d.reason, /no configured adapter/);
 });
 
-test("manual defaults to false when omitted", () => {
-  const d = evaluate(input({}, { autoPost: false }));
-  assert.equal(d.outcome, "dry_run");
+test("paused defaults to false — publishing is on unless explicitly stopped", () => {
+  const { paused, ...noPause } = input();
+  void paused;
+  assert.equal(evaluate(noPause).outcome, "publish");
+});
+
+test("a malformed paused value cannot silently halt the calendar", () => {
+  // Only boolean true pauses; the worker coerces with `raw.paused === true`.
+  assert.equal(evaluate(input({}, { paused: false })).outcome, "publish");
 });

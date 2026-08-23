@@ -4,6 +4,19 @@
  * Every reason a case may or may not be published lives here, as one pure
  * function over data. It has no IO, so it is trivially testable and it is the
  * single place to audit before anything can reach a public channel.
+ *
+ * THE RULE (JC, 2026-08-23): "Now that you're putting dates on each post, it
+ * should always be on. If something is approved and we set a scheduled date,
+ * then it will go if it's green."
+ *
+ * So there is no autoPost switch any more. It used to mean "this post has no
+ * date, publish it daily at a fixed time" — a concept that died the moment
+ * every case carried its own publish_at. Approved + due is now the whole
+ * contract.
+ *
+ * `paused` is NOT that switch coming back. It is an instance-wide emergency
+ * stop, default false, for the case where something is wrong and everything
+ * must halt at once. It is not per-post and it is not part of normal operation.
  */
 
 import type { CalendarEntry } from "./cases.js";
@@ -18,7 +31,6 @@ export interface GateDecision {
 export interface GateInput {
   entry: CalendarEntry;
   now: Date;
-  autoPost: boolean;
   enabledChannels: string[];
   lookbackHours: number;
   /** True when publish_attempts already holds a 'sent' row for this case. */
@@ -26,16 +38,21 @@ export interface GateInput {
   /** True when a channel adapter exists AND reports itself configured. */
   adapterReady: boolean;
   /**
+   * Instance-wide emergency stop. Default false.
+   *
+   * When set, nothing publishes by any route — including Post Now, because a
+   * stop that a button can walk past is not a stop. Due posts are recorded as
+   * dry_run so there is a record of what would have gone out.
+   */
+  paused?: boolean;
+  /**
    * A human clicked "Post Now" on this specific case.
    *
-   * This is an AUTHORIZATION, not a bypass. It substitutes for the `autoPost`
-   * switch (a deliberate click is the same intent, scoped to one post) and it
-   * ignores the schedule, because "now" is the entire point.
-   *
-   * It does NOT relax anything that protects correctness or the reviewer:
+   * Ignores the schedule, because choosing the moment is the entire point. It
+   * does NOT relax anything protecting correctness or the reviewer:
    * already-sent, an existing publish_url, cancelled/done, the native
-   * `approved` status, a missing caption, an unlisted channel, or an
-   * unconfigured adapter all still block. See the tests.
+   * `approved` status, a missing caption, an unlisted channel, an unconfigured
+   * adapter, and the emergency pause all still block. See the tests.
    */
   manual?: boolean;
 }
@@ -44,11 +61,11 @@ export function evaluate(input: GateInput): GateDecision {
   const {
     entry,
     now,
-    autoPost,
     enabledChannels,
     lookbackHours,
     alreadySent,
     adapterReady,
+    paused = false,
     manual = false,
   } = input;
 
@@ -72,8 +89,8 @@ export function evaluate(input: GateInput): GateDecision {
   }
 
   // 3. Approval — the NATIVE case status, not a JSON field.
-  //    Post Now does not override this. A human clicking publish is not the
-  //    same as a reviewer approving the copy.
+  //    Green is the whole gate. Post Now does not override this: a human
+  //    clicking publish is not the same as a reviewer approving the copy.
   if (!entry.approved) {
     return {
       outcome: "skipped",
@@ -128,17 +145,17 @@ export function evaluate(input: GateInput): GateDecision {
     }
   }
 
-  // 7. Everything passed. The last gate is authorization: either the operator
-  //    armed autoPost, or a human just clicked Post Now on this one case.
-  if (!autoPost && !manual) {
+  // 7. Approved, due, deliverable. The only thing left that can stop it is the
+  //    emergency pause, which stops every route including Post Now.
+  if (paused) {
     return {
       outcome: "dry_run",
-      reason: "would publish, but autoPost is off",
+      reason: "would publish, but publishing is paused instance-wide",
     };
   }
 
   return {
     outcome: "publish",
-    reason: manual ? "posted manually by an operator" : "due and approved",
+    reason: manual ? "posted manually by an operator" : "approved and due",
   };
 }

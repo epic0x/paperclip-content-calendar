@@ -73,12 +73,17 @@ this order:
 6. no channel, channel not enabled in config, or no configured adapter → `skipped`
 7. no `publish_at`, unparseable, or not due yet → `skipped`
 8. overdue beyond `lookbackHours` → `skipped` (reschedule rather than post late)
-9. **`autoPost` is off → `dry_run`** — evaluated, recorded, nothing sent
+9. **the emergency pause is on → `dry_run`** — evaluated, recorded, nothing sent
 10. otherwise → `publish`
 
-`autoPost` defaults to `false` and fails closed: any value other than boolean
-`true` is treated as off. **Nothing reaches a public channel until an operator
-turns it on.**
+**There is no per-post arming switch.** Approved + a publish date that has
+arrived is the entire contract (JC, 2026-08-23: *"if something is approved and
+we set a scheduled date, then it will go if it's green"*). The old `autoPost`
+flag meant "this post has no date, publish it daily at a fixed time" — a concept
+that died once every case carried its own `publish_at`.
+
+`paused` is an instance-wide emergency stop, default off. It halts every route
+including Post Now, because a stop a button can walk past is not a stop.
 
 ---
 
@@ -90,7 +95,7 @@ Set on the plugin's settings page after install:
 | --- | --- | --- |
 | `apiBaseUrl` | yes | Where to reach the Cases API. Use the loopback origin, e.g. `http://127.0.0.1:3100`. |
 | `boardApiKeyRef` | yes | Secret **reference** to a board API key (`paperclipai token board create`). Resolved per call, never cached or logged. Without it the calendar shows a clear "not configured" notice instead of rendering empty. |
-| `autoPost` | no | Default `false`. The only switch that can publish. |
+| `paused` | no | Default `false`. Emergency stop for the whole instance. Not a per-post switch. |
 | `channels` | no | Channel keys the job may send to. A case on an unlisted channel is skipped with a reason. |
 | `lookbackHours` | no | Default 6. How late a missed post may still go out. |
 

@@ -103,11 +103,11 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "Secret reference to a board API key created with `paperclipai token board create`. Required to read cases. Without it the calendar renders empty and the publish job reports a configuration error rather than failing silently.",
       },
-      autoPost: {
+      paused: {
         type: "boolean",
-        title: "Actually publish",
+        title: "Pause all publishing (emergency stop)",
         description:
-          "OFF by default and must stay off until JC approves. When off, the publish job evaluates every due case and records a dry_run attempt without contacting any channel. Turning this on is the only thing that can put a post in public.",
+          "Normally OFF. Publishing is driven by the posts themselves: approved + a publish_at that has arrived. This is the instance-wide stop for when something is wrong — it halts every route including Post Now, and records what would have gone out as a dry run.",
         default: false,
       },
       channels: {
@@ -145,7 +145,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: JOB_PUBLISH_DUE,
       displayName: "Publish due cases",
       description:
-        "Every minute: find approved social_post cases whose publish_at is due and not yet published, then publish them. With autoPost off, records a dry-run attempt instead of sending.",
+        "Every minute: find approved social_post cases whose publish_at is due and not yet published, then publish them. Approved plus due is the whole rule; the emergency pause records a dry run instead of sending.",
       // EVERY MINUTE, deliberately.
       //
       // This was */15, and that is why a post scheduled for 18:22 sat there:

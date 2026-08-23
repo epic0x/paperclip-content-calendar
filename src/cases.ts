@@ -62,7 +62,8 @@ export interface CalendarEntry {
 export interface CalendarConfig {
   apiBaseUrl: string;
   boardApiKeyRef?: unknown;
-  autoPost: boolean;
+  /** Instance-wide emergency stop. Default false. Not a per-post switch. */
+  paused: boolean;
   channels: string[];
   lookbackHours: number;
   /** Secret references for the X OAuth 1.0a credential set. */
@@ -94,7 +95,7 @@ export class CasesNotConfiguredError extends Error {
 
 const DEFAULTS: CalendarConfig = {
   apiBaseUrl: "http://127.0.0.1:3100",
-  autoPost: false,
+  paused: false,
   channels: [],
   lookbackHours: 6,
 };
@@ -112,8 +113,10 @@ export async function readConfig(
         ? raw.apiBaseUrl.trim().replace(/\/+$/, "")
         : DEFAULTS.apiBaseUrl,
     boardApiKeyRef: raw.boardApiKeyRef,
-    // Fail closed: anything other than an explicit true means do not publish.
-    autoPost: raw.autoPost === true,
+    // Publishing is on by default now that every case carries its own date.
+    // Only an explicit `true` pauses, so a malformed value cannot silently
+    // halt the calendar.
+    paused: raw.paused === true,
     channels: Array.isArray(raw.channels)
       ? raw.channels.filter((c): c is string => typeof c === "string")
       : DEFAULTS.channels,
