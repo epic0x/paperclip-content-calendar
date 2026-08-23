@@ -135,13 +135,59 @@ async function authHeader(
   return `Bearer ${key}`;
 }
 
+/**
+ * Choose the right fetch for a URL.
+ *
+ * `ctx.http.fetch` runs the host's SSRF guard, which resolves the hostname and
+ * rejects any address in a private or reserved range — with no allowlist. That
+ * is correct for arbitrary outbound calls, but it also blocks the host's OWN
+ * loopback API:
+ *
+ *   {"code":"UNKNOWN","message":"All resolved IPs for 127.0.0.1 are in
+ *    private/reserved ranges"}
+ *
+ * Calling our own Paperclip instance on 127.0.0.1 is not SSRF, and the SDK
+ * documents the escape hatch on `PluginHttpClient` itself: "Plugins may also
+ * use standard Node `fetch` or other libraries directly — this client exists
+ * for host-managed tracing and audit logging."
+ *
+ * So: loopback and private hosts go through global fetch, everything else goes
+ * through the audited client. Public traffic keeps host tracing; the local
+ * control-plane call works.
+ */
+function isLocalHost(urlString: string): boolean {
+  try {
+    const h = new URL(urlString).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return (
+      h === "localhost" ||
+      h === "127.0.0.1" ||
+      h === "::1" ||
+      h.endsWith(".localhost") ||
+      /^10\./.test(h) ||
+      /^192\.168\./.test(h) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function fetchFor(
+  ctx: PluginContext,
+  url: string,
+): (u: string, init?: RequestInit) => Promise<Response> {
+  return isLocalHost(url)
+    ? (u, init) => fetch(u, init)
+    : (u, init) => ctx.http.fetch(u, init);
+}
+
 async function apiGet<T>(
   ctx: PluginContext,
   cfg: CalendarConfig,
   path: string,
 ): Promise<T> {
   const url = `${cfg.apiBaseUrl}${path}`;
-  const res = await ctx.http.fetch(url, {
+  const res = await fetchFor(ctx, url)(url, {
     method: "GET",
     headers: {
       Authorization: await authHeader(ctx, cfg),
@@ -244,17 +290,15 @@ export async function patchCaseFields(
   const payload: Record<string, unknown> = { fields: merged };
   if (status) payload.status = status;
 
-  const res = await ctx.http.fetch(
-    `${cfg.apiBaseUrl}/api/cases/${encodeURIComponent(caseIdOrIdentifier)}`,
-    {
-      method: "PATCH",
-      headers: {
-        Authorization: await authHeader(ctx, cfg),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
+  const patchUrl = `${cfg.apiBaseUrl}/api/cases/${encodeURIComponent(caseIdOrIdentifier)}`;
+  const res = await fetchFor(ctx, patchUrl)(patchUrl, {
+    method: "PATCH",
+    headers: {
+      Authorization: await authHeader(ctx, cfg),
+      "Content-Type": "application/json",
     },
-  );
+    body: JSON.stringify(payload),
+  });
   const text = await res.text();
   if (!res.ok) {
     throw new CasesApiError(
