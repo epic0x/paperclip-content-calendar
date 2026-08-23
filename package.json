@@ -1,6 +1,6 @@
 {
   "name": "@untrace/paperclip-plugin-content-calendar",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Content calendar and publish scheduler for Paperclip. Reads social_post cases, renders them on a month grid, and publishes approved cases when due.",
   "type": "module",
   "private": true,

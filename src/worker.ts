@@ -10,6 +10,7 @@ import {
   DB_NAMESPACE,
   JOB_PUBLISH_DUE,
   PLUGIN_ID,
+  UNTRACE_COMPANY_ID,
 } from "./manifest.js";
 import {
   CasesNotConfiguredError,
@@ -564,10 +565,11 @@ async function publishSweep(
 
 async function registerJobs(ctx: PluginContext): Promise<void> {
   ctx.jobs.register(JOB_PUBLISH_DUE, async (job: PluginJobContext) => {
-    const companies = await ctx.companies.list();
-    for (const company of companies) {
-      await publishSweep(ctx, company.id, `job:${job.jobKey}:${job.trigger}`);
-    }
+    await publishSweep(
+      ctx,
+      UNTRACE_COMPANY_ID,
+      `job:${job.jobKey}:${job.trigger}`,
+    );
   });
 }
 

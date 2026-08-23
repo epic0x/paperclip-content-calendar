@@ -7,6 +7,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { evaluate } from "../dist/gate.js";
 
 const NOW = new Date("2026-08-24T12:00:00Z");
@@ -211,4 +212,10 @@ test("paused defaults to false — publishing is on unless explicitly stopped", 
 test("a malformed paused value cannot silently halt the calendar", () => {
   // Only boolean true pauses; the worker coerces with `raw.paused === true`.
   assert.equal(evaluate(input({}, { paused: false })).outcome, "publish");
+});
+
+test("scheduled publishing does not depend on companies.list invocation scope", async () => {
+  const worker = await readFile(new URL("../src/worker.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(worker, /ctx\.companies\.list\(\)/);
+  assert.match(worker, /UNTRACE_COMPANY_ID/);
 });
