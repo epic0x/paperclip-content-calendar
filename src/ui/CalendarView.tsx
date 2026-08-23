@@ -1,403 +1,655 @@
-import { useCallback, useState } from "react";
+import { useMemo, useState } from "react";
 import { usePluginAction, usePluginData } from "@paperclipai/plugin-sdk/ui";
-import { PostEditor } from "./PostEditor.js";
 
-type Post = {
+// ---------------------------------------------------------------------------
+// Types mirroring what the worker's data handlers return
+// ---------------------------------------------------------------------------
+
+export interface CalendarEntry {
   id: string;
-  content: string;
-  scheduled_date: string;
-  scheduled_time: string | null;
+  identifier: string;
+  key: string | null;
+  title: string;
   status: string;
-  platform: string;
-  post_url: string | null;
-  error_message: string | null;
-};
+  publishAt: string | null;
+  channel: string | null;
+  caption: string | null;
+  mediaFile: string | null;
+  publishUrl: string | null;
+  approved: boolean;
+}
 
-type CalendarDay = {
+interface CalendarDay {
   date: string;
-  posts: Post[];
+  entries: CalendarEntry[];
+}
+
+interface CalendarData {
+  configured: boolean;
+  error: string | null;
+  days: CalendarDay[];
+  unscheduled: CalendarEntry[];
+  stats: {
+    total: number;
+    scheduled: number;
+    unscheduled: number;
+    approved: number;
+    inReview: number;
+    published: number;
+    cancelled: number;
+  } | null;
+}
+
+// ---------------------------------------------------------------------------
+// Date helpers — the grid is UTC, deliberately. publish_at is stored as an
+// instant, and rendering it in browser-local time would silently shift a post
+// into the previous or next day for anyone outside UTC.
+// ---------------------------------------------------------------------------
+
+const DAY_MS = 86_400_000;
+
+function ymd(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+function startOfMonth(year: number, month: number): Date {
+  return new Date(Date.UTC(year, month, 1));
+}
+
+/** Monday-first grid covering the whole month. */
+function monthGrid(year: number, month: number): string[] {
+  const first = startOfMonth(year, month);
+  const offset = (first.getUTCDay() + 6) % 7; // Mon = 0
+  const gridStart = new Date(first.getTime() - offset * DAY_MS);
+  return Array.from({ length: 42 }, (_, i) =>
+    ymd(new Date(gridStart.getTime() + i * DAY_MS)),
+  );
+}
+
+function timeOf(iso: string | null): string {
+  if (!iso) return "";
+  return new Date(iso).toISOString().slice(11, 16) + "Z";
+}
+
+const MONTHS = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+
+const CHANNEL_COLORS: Record<string, string> = {
+  x: "#1d9bf0",
+  linkedin: "#0a66c2",
+  instagram: "#e1306c",
+  youtube: "#ff0000",
 };
 
-type CalendarData = {
-  calendar: CalendarDay[];
-  totalPosts: number;
+function channelColor(ch: string | null): string {
+  if (!ch) return "#71717a";
+  return CHANNEL_COLORS[ch.toLowerCase()] ?? "#71717a";
+}
+
+const STATUS_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
+  draft: { bg: "#3f3f46", fg: "#d4d4d8", label: "Draft" },
+  in_progress: { bg: "#1e3a5f", fg: "#93c5fd", label: "In progress" },
+  in_review: { bg: "#4a3410", fg: "#fbbf24", label: "In review" },
+  approved: { bg: "#14432a", fg: "#4ade80", label: "Approved" },
+  done: { bg: "#1f2937", fg: "#9ca3af", label: "Done" },
+  cancelled: { bg: "#3f1d1d", fg: "#f87171", label: "Cancelled" },
 };
 
-type PostStats = {
-  total: number;
-  draft: number;
-  approved: number;
-  posted: number;
-  failed: number;
-  cancelled: number;
-};
+// ---------------------------------------------------------------------------
+// Small presentational pieces
+// ---------------------------------------------------------------------------
 
-const tokens = {
-  border: "var(--border, oklch(0.269 0 0))",
-  card: "var(--card, oklch(0.205 0 0))",
-  bg: "var(--background, oklch(0.145 0 0))",
-  fg: "var(--foreground, oklch(0.985 0 0))",
-  muted: "var(--muted-foreground, oklch(0.708 0 0))",
-  primary: "var(--primary, oklch(0.985 0 0))",
-  primaryFg: "var(--primary-foreground, oklch(0.205 0 0))",
-  accent: "var(--accent, oklch(0.269 0 0))",
-  calendarPurple: "oklch(0.35 0.08 280)",
-  calendarPurpleFg: "oklch(0.85 0.12 280)",
-};
-
-const statusConfig: Record<string, { bg: string; fg: string; label: string }> = {
-  draft: { bg: "oklch(0.27 0.06 250)", fg: "oklch(0.85 0.1 250)", label: "Draft" },
-  approved: { bg: "oklch(0.27 0.06 145)", fg: "oklch(0.85 0.1 145)", label: "Approved" },
-  posted: { bg: "oklch(0.22 0.06 145)", fg: "oklch(0.72 0.15 145)", label: "Posted" },
-  failed: { bg: "oklch(0.27 0.08 25)", fg: "oklch(0.82 0.13 25)", label: "Failed" },
-  cancelled: { bg: "oklch(0.2 0 0)", fg: "oklch(0.55 0 0)", label: "Cancelled" },
-};
-
-function StatusBadge({ status }: { status: string }) {
-  const cfg = statusConfig[status] ?? statusConfig.draft!;
+function StatusPill({ status }: { status: string }) {
+  const s = STATUS_STYLE[status] ?? STATUS_STYLE.draft;
   return (
     <span
       style={{
-        padding: "2px 8px",
-        borderRadius: 20,
-        fontSize: 11,
+        background: s.bg,
+        color: s.fg,
+        borderRadius: 4,
+        padding: "1px 6px",
+        fontSize: 10,
         fontWeight: 600,
-        background: cfg.bg,
-        color: cfg.fg,
-        textTransform: "capitalize",
+        letterSpacing: 0.2,
         whiteSpace: "nowrap",
       }}
     >
-      {cfg.label}
+      {s.label}
     </span>
   );
 }
 
-function PostCard({ post, onEdit, onApprove, onUnapprove }: {
-  post: Post;
-  onEdit: (post: Post) => void;
-  onApprove: (postId: string) => Promise<void>;
-  onUnapprove: (postId: string) => Promise<void>;
+function Stat({ label, value, tone }: { label: string; value: number; tone?: string }) {
+  return (
+    <div
+      style={{
+        border: "1px solid #27272a",
+        borderRadius: 8,
+        padding: "10px 14px",
+        minWidth: 92,
+        background: "#18181b",
+      }}
+    >
+      <div style={{ fontSize: 22, fontWeight: 600, color: tone ?? "#fafafa", lineHeight: 1.1 }}>
+        {value}
+      </div>
+      <div style={{ fontSize: 11, color: "#a1a1aa", marginTop: 2 }}>{label}</div>
+    </div>
+  );
+}
+
+function EntryChip({
+  entry,
+  onSelect,
+}: {
+  entry: CalendarEntry;
+  onSelect: (e: CalendarEntry) => void;
 }) {
-  const [busy, setBusy] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(entry)}
+      title={`${entry.identifier} — ${entry.title}`}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 5,
+        width: "100%",
+        textAlign: "left",
+        background: entry.publishUrl ? "#14432a" : "#27272a",
+        border: "none",
+        borderLeft: `3px solid ${channelColor(entry.channel)}`,
+        borderRadius: 3,
+        padding: "3px 5px",
+        marginBottom: 2,
+        cursor: "pointer",
+        color: "#e4e4e7",
+        fontSize: 11,
+        overflow: "hidden",
+      }}
+    >
+      <span style={{ color: "#a1a1aa", fontVariantNumeric: "tabular-nums" }}>
+        {timeOf(entry.publishAt)}
+      </span>
+      <span
+        style={{
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          flex: 1,
+        }}
+      >
+        {entry.title}
+      </span>
+      {entry.approved && <span style={{ color: "#4ade80" }}>✓</span>}
+      {entry.publishUrl && <span style={{ color: "#4ade80" }}>↗</span>}
+    </button>
+  );
+}
 
-  const handleApprove = useCallback(async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setBusy(true);
-    try {
-      await onApprove(post.id);
-    } finally {
-      setBusy(false);
-    }
-  }, [post.id, onApprove]);
-
-  const handleUnapprove = useCallback(async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setBusy(true);
-    try {
-      await onUnapprove(post.id);
-    } finally {
-      setBusy(false);
-    }
-  }, [post.id, onUnapprove]);
+function DetailPanel({
+  entry,
+  onClose,
+  onReschedule,
+  busy,
+}: {
+  entry: CalendarEntry;
+  onClose: () => void;
+  onReschedule: (iso: string) => void;
+  busy: boolean;
+}) {
+  const [when, setWhen] = useState(
+    entry.publishAt ? entry.publishAt.slice(0, 16) : "",
+  );
 
   return (
     <div
-      onClick={() => onEdit(post)}
       style={{
-        background: tokens.bg,
-        border: `1px solid ${tokens.border}`,
-        borderRadius: 8,
-        padding: "10px 12px",
-        cursor: "pointer",
-        transition: "border-color 0.15s",
-        marginBottom: 8,
+        position: "fixed",
+        top: 0,
+        right: 0,
+        bottom: 0,
+        width: 420,
+        maxWidth: "100vw",
+        background: "#09090b",
+        borderLeft: "1px solid #27272a",
+        padding: 20,
+        overflowY: "auto",
+        zIndex: 50,
+        boxShadow: "-8px 0 24px rgba(0,0,0,0.4)",
       }}
-      onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.borderColor = "oklch(0.5 0.1 280)"; }}
-      onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.borderColor = tokens.border; }}
     >
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, marginBottom: 6 }}>
-        <StatusBadge status={post.status} />
-        {post.scheduled_time && (
-          <span style={{ fontSize: 11, color: tokens.muted }}>{post.scheduled_time.slice(0, 5)}</span>
-        )}
-      </div>
-
-      <p style={{
-        margin: "0 0 8px 0",
-        fontSize: 13,
-        lineHeight: 1.5,
-        color: tokens.fg,
-        display: "-webkit-box",
-        WebkitLineClamp: 3,
-        WebkitBoxOrient: "vertical",
-        overflow: "hidden",
-      }}>
-        {post.content}
-      </p>
-
-      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-        {post.status === "draft" && (
-          <button
-            onClick={handleApprove}
-            disabled={busy}
-            style={{
-              padding: "3px 10px",
-              fontSize: 12,
-              background: "oklch(0.27 0.06 145)",
-              border: `1px solid oklch(0.45 0.12 145)`,
-              borderRadius: 6,
-              color: "oklch(0.9 0.12 145)",
-              cursor: busy ? "not-allowed" : "pointer",
-              fontWeight: 600,
-            }}
-          >
-            Approve
-          </button>
-        )}
-        {post.status === "approved" && (
-          <button
-            onClick={handleUnapprove}
-            disabled={busy}
-            style={{
-              padding: "3px 10px",
-              fontSize: 12,
-              background: "oklch(0.27 0.06 250)",
-              border: `1px solid oklch(0.45 0.12 250)`,
-              borderRadius: 6,
-              color: "oklch(0.85 0.1 250)",
-              cursor: busy ? "not-allowed" : "pointer",
-            }}
-          >
-            Unapprove
-          </button>
-        )}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "start", gap: 12 }}>
+        <div>
+          <div style={{ fontSize: 12, color: "#a1a1aa", fontFamily: "ui-monospace, monospace" }}>
+            {entry.identifier}
+          </div>
+          <h3 style={{ margin: "4px 0 0", fontSize: 16, color: "#fafafa" }}>{entry.title}</h3>
+        </div>
         <button
-          onClick={(e) => { e.stopPropagation(); onEdit(post); }}
+          type="button"
+          onClick={onClose}
           style={{
-            padding: "3px 10px",
-            fontSize: 12,
             background: "transparent",
-            border: `1px solid ${tokens.border}`,
+            border: "1px solid #3f3f46",
+            color: "#a1a1aa",
             borderRadius: 6,
-            color: tokens.muted,
+            padding: "2px 8px",
             cursor: "pointer",
           }}
         >
-          Edit
+          ✕
         </button>
+      </div>
+
+      <div style={{ display: "flex", gap: 6, marginTop: 12, flexWrap: "wrap" }}>
+        <StatusPill status={entry.status} />
+        {entry.channel && (
+          <span
+            style={{
+              background: channelColor(entry.channel),
+              color: "#fff",
+              borderRadius: 4,
+              padding: "1px 6px",
+              fontSize: 10,
+              fontWeight: 600,
+            }}
+          >
+            {entry.channel}
+          </span>
+        )}
+      </div>
+
+      {entry.caption && (
+        <pre
+          style={{
+            marginTop: 14,
+            background: "#18181b",
+            border: "1px solid #27272a",
+            borderRadius: 8,
+            padding: 12,
+            color: "#d4d4d8",
+            fontSize: 12,
+            lineHeight: 1.55,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+            fontFamily: "inherit",
+          }}
+        >
+          {entry.caption}
+        </pre>
+      )}
+
+      {entry.publishUrl ? (
+        <p style={{ marginTop: 14, fontSize: 12 }}>
+          <a href={entry.publishUrl} target="_blank" rel="noreferrer" style={{ color: "#4ade80" }}>
+            Published → {entry.publishUrl}
+          </a>
+        </p>
+      ) : null}
+
+      <div style={{ marginTop: 20, borderTop: "1px solid #27272a", paddingTop: 16 }}>
+        <label style={{ fontSize: 11, color: "#a1a1aa", display: "block", marginBottom: 6 }}>
+          Publish at (UTC)
+        </label>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            type="datetime-local"
+            value={when}
+            onChange={(e) => setWhen(e.target.value)}
+            style={{
+              flex: 1,
+              background: "#18181b",
+              border: "1px solid #3f3f46",
+              borderRadius: 6,
+              color: "#fafafa",
+              padding: "6px 8px",
+              fontSize: 12,
+            }}
+          />
+          <button
+            type="button"
+            disabled={busy || !when}
+            onClick={() => onReschedule(`${when}:00Z`)}
+            style={{
+              background: busy ? "#3f3f46" : "#2563eb",
+              border: "none",
+              borderRadius: 6,
+              color: "#fff",
+              padding: "6px 14px",
+              fontSize: 12,
+              cursor: busy ? "default" : "pointer",
+            }}
+          >
+            {busy ? "Saving…" : "Save"}
+          </button>
+        </div>
+        <p style={{ fontSize: 11, color: "#71717a", marginTop: 8, lineHeight: 1.5 }}>
+          Approval is the case status, not a field here. Move the case to{" "}
+          <strong style={{ color: "#4ade80" }}>Approved</strong> in Paperclip and the
+          publish job will pick it up when it is due.
+        </p>
       </div>
     </div>
   );
 }
 
-function DayColumn({ day, onEdit, onApprove, onUnapprove }: {
-  day: CalendarDay;
-  onEdit: (post: Post) => void;
-  onApprove: (postId: string) => Promise<void>;
-  onUnapprove: (postId: string) => Promise<void>;
-}) {
-  const date = new Date(day.date + "T00:00:00");
-  const isToday = day.date === new Date().toISOString().slice(0, 10);
-  const dayName = date.toLocaleDateString("en-US", { weekday: "short" });
-  const dayNum = date.getDate();
-  const monthName = date.toLocaleDateString("en-US", { month: "short" });
+// ---------------------------------------------------------------------------
+// Main calendar
+// ---------------------------------------------------------------------------
 
+export function CalendarView({ companyId }: { companyId: string | null }) {
+  const today = new Date();
+  const [year, setYear] = useState(today.getUTCFullYear());
+  const [month, setMonth] = useState(today.getUTCMonth());
+  const [selected, setSelected] = useState<CalendarEntry | null>(null);
+  const [channelFilter, setChannelFilter] = useState<string>("all");
+  const [busy, setBusy] = useState(false);
+
+  const grid = useMemo(() => monthGrid(year, month), [year, month]);
+  const from = grid[0];
+  const to = grid[grid.length - 1];
+
+  const { data, loading, error, refresh } = usePluginData<CalendarData>(
+    "calendar",
+    companyId ? { companyId, from, to } : undefined,
+  );
+  const reschedule = usePluginAction("reschedule");
+
+  const byDay = useMemo(() => {
+    const m = new Map<string, CalendarEntry[]>();
+    for (const d of data?.days ?? []) {
+      const filtered =
+        channelFilter === "all"
+          ? d.entries
+          : d.entries.filter(
+              (e) => (e.channel ?? "").toLowerCase() === channelFilter,
+            );
+      if (filtered.length) m.set(d.date, filtered);
+    }
+    return m;
+  }, [data, channelFilter]);
+
+  const channels = useMemo(() => {
+    const s = new Set<string>();
+    for (const d of data?.days ?? []) {
+      for (const e of d.entries) if (e.channel) s.add(e.channel.toLowerCase());
+    }
+    return [...s].sort();
+  }, [data]);
+
+  if (!companyId) {
+    return <Notice title="No company selected" body="Open the calendar inside a company." />;
+  }
+  if (error) {
+    return <Notice title="Could not load the calendar" body={error.message} tone="error" />;
+  }
+  if (loading && !data) {
+    return <Notice title="Loading…" body="Reading cases from Paperclip." />;
+  }
+  if (data && !data.configured) {
+    return (
+      <Notice
+        tone="error"
+        title="Plugin is not configured"
+        body={
+          data.error ??
+          "A board API key is required so the plugin can read cases. Create one with `paperclipai token board create` and set it in the plugin settings."
+        }
+      />
+    );
+  }
+
+  const stats = data?.stats;
+  const monthLabel = `${MONTHS[month]} ${year}`;
+
+  const step = (delta: number) => {
+    const d = new Date(Date.UTC(year, month + delta, 1));
+    setYear(d.getUTCFullYear());
+    setMonth(d.getUTCMonth());
+  };
+
+  const onReschedule = async (iso: string) => {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      await reschedule({
+        companyId,
+        caseId: selected.id,
+        caseIdentifier: selected.identifier,
+        publishAt: iso,
+        previousPublishAt: selected.publishAt,
+      });
+      setSelected(null);
+      refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ color: "#fafafa" }}>
+      <header style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <h2 style={{ margin: 0, fontSize: 20 }}>Content Calendar</h2>
+        <div style={{ display: "flex", gap: 4, marginLeft: "auto", alignItems: "center" }}>
+          <NavButton onClick={() => step(-1)}>←</NavButton>
+          <span style={{ minWidth: 150, textAlign: "center", fontSize: 14 }}>{monthLabel}</span>
+          <NavButton onClick={() => step(1)}>→</NavButton>
+          <NavButton
+            onClick={() => {
+              const n = new Date();
+              setYear(n.getUTCFullYear());
+              setMonth(n.getUTCMonth());
+            }}
+          >
+            Today
+          </NavButton>
+        </div>
+      </header>
+
+      {stats && (
+        <div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" }}>
+          <Stat label="Total posts" value={stats.total} />
+          <Stat label="Scheduled" value={stats.scheduled} />
+          <Stat label="In review" value={stats.inReview} tone="#fbbf24" />
+          <Stat label="Approved" value={stats.approved} tone="#4ade80" />
+          <Stat label="Published" value={stats.published} tone="#4ade80" />
+          <Stat label="No date" value={stats.unscheduled} tone="#f87171" />
+        </div>
+      )}
+
+      {channels.length > 1 && (
+        <div style={{ display: "flex", gap: 6, marginTop: 14 }}>
+          <FilterChip active={channelFilter === "all"} onClick={() => setChannelFilter("all")}>
+            All
+          </FilterChip>
+          {channels.map((c) => (
+            <FilterChip key={c} active={channelFilter === c} onClick={() => setChannelFilter(c)}>
+              {c}
+            </FilterChip>
+          ))}
+        </div>
+      )}
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(7, minmax(0, 1fr))",
+          gap: 1,
+          marginTop: 16,
+          background: "#27272a",
+          border: "1px solid #27272a",
+          borderRadius: 8,
+          overflow: "hidden",
+        }}
+      >
+        {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d) => (
+          <div
+            key={d}
+            style={{
+              background: "#18181b",
+              padding: "6px 8px",
+              fontSize: 11,
+              color: "#a1a1aa",
+              fontWeight: 600,
+            }}
+          >
+            {d}
+          </div>
+        ))}
+
+        {grid.map((date) => {
+          const inMonth = Number(date.slice(5, 7)) === month + 1;
+          const isToday = date === ymd(new Date());
+          const entries = byDay.get(date) ?? [];
+          return (
+            <div
+              key={date}
+              style={{
+                background: inMonth ? "#09090b" : "#111113",
+                minHeight: 96,
+                padding: 5,
+                opacity: inMonth ? 1 : 0.45,
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 11,
+                  color: isToday ? "#fafafa" : "#71717a",
+                  fontWeight: isToday ? 700 : 400,
+                  background: isToday ? "#2563eb" : "transparent",
+                  borderRadius: 4,
+                  display: "inline-block",
+                  padding: isToday ? "0 5px" : 0,
+                  marginBottom: 3,
+                }}
+              >
+                {Number(date.slice(8, 10))}
+              </div>
+              {entries.map((e) => (
+                <EntryChip key={e.id} entry={e} onSelect={setSelected} />
+              ))}
+            </div>
+          );
+        })}
+      </div>
+
+      {data && data.unscheduled.length > 0 && (
+        <section style={{ marginTop: 22 }}>
+          <h3 style={{ fontSize: 13, color: "#f87171", margin: "0 0 8px" }}>
+            {data.unscheduled.length} post{data.unscheduled.length === 1 ? "" : "s"} with no
+            publish date
+          </h3>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {data.unscheduled.slice(0, 40).map((e) => (
+              <button
+                key={e.id}
+                type="button"
+                onClick={() => setSelected(e)}
+                style={{
+                  background: "#18181b",
+                  border: "1px solid #3f3f46",
+                  borderRadius: 6,
+                  padding: "4px 8px",
+                  color: "#d4d4d8",
+                  fontSize: 11,
+                  cursor: "pointer",
+                }}
+              >
+                {e.identifier} · {e.title.slice(0, 42)}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {selected && (
+        <DetailPanel
+          entry={selected}
+          busy={busy}
+          onClose={() => setSelected(null)}
+          onReschedule={onReschedule}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+function NavButton({ children, onClick }: { children: React.ReactNode; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        background: "#18181b",
+        border: "1px solid #3f3f46",
+        color: "#e4e4e7",
+        borderRadius: 6,
+        padding: "3px 10px",
+        fontSize: 12,
+        cursor: "pointer",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function FilterChip({
+  children,
+  active,
+  onClick,
+}: {
+  children: React.ReactNode;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        background: active ? "#2563eb" : "#18181b",
+        border: `1px solid ${active ? "#2563eb" : "#3f3f46"}`,
+        color: active ? "#fff" : "#a1a1aa",
+        borderRadius: 999,
+        padding: "3px 12px",
+        fontSize: 11,
+        cursor: "pointer",
+        textTransform: "capitalize",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+export function Notice({
+  title,
+  body,
+  tone,
+}: {
+  title: string;
+  body: string;
+  tone?: "error";
+}) {
   return (
     <div
       style={{
-        minWidth: 180,
-        maxWidth: 220,
-        flex: "1 1 180px",
-        background: isToday ? "oklch(0.18 0.04 280)" : tokens.card,
-        border: `1px solid ${isToday ? "oklch(0.4 0.1 280)" : tokens.border}`,
-        borderRadius: 10,
-        padding: "12px 10px",
-        display: "flex",
-        flexDirection: "column",
-        gap: 0,
+        border: `1px solid ${tone === "error" ? "#7f1d1d" : "#27272a"}`,
+        background: tone === "error" ? "#1f1113" : "#18181b",
+        borderRadius: 8,
+        padding: 18,
+        color: "#e4e4e7",
+        maxWidth: 640,
       }}
     >
-      <div style={{ marginBottom: 12, textAlign: "center" }}>
-        <div style={{ fontSize: 12, color: tokens.muted, textTransform: "uppercase", letterSpacing: 1 }}>{dayName}</div>
-        <div style={{ fontSize: 22, fontWeight: 700, color: isToday ? "oklch(0.85 0.15 280)" : tokens.fg, lineHeight: 1.2 }}>{dayNum}</div>
-        <div style={{ fontSize: 11, color: tokens.muted }}>{monthName}</div>
-        {isToday && (
-          <div style={{ fontSize: 10, color: "oklch(0.7 0.12 280)", marginTop: 2, fontWeight: 600 }}>TODAY</div>
-        )}
-      </div>
-
-      <div style={{ flex: 1, minHeight: 60 }}>
-        {day.posts.length === 0 ? (
-          <div style={{ textAlign: "center", color: tokens.muted, fontSize: 12, padding: "16px 0", opacity: 0.6 }}>
-            No posts
-          </div>
-        ) : (
-          day.posts.map((post) => (
-            <PostCard
-              key={post.id}
-              post={post}
-              onEdit={onEdit}
-              onApprove={onApprove}
-              onUnapprove={onUnapprove}
-            />
-          ))
-        )}
-      </div>
-    </div>
-  );
-}
-
-export function CalendarView({ companyId }: { companyId: string }) {
-  const [editingPost, setEditingPost] = useState<Post | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
-  const [generating, setGenerating] = useState(false);
-  const [generateError, setGenerateError] = useState<string | null>(null);
-
-  const calendarData = usePluginData<CalendarData>("calendar", { companyId, days: 10 }, [refreshKey]);
-  const statsData = usePluginData<PostStats>("stats", { companyId }, [refreshKey]);
-  const generateBatch = usePluginAction("generate-batch");
-  const approvePost = usePluginAction("approve-post");
-  const unapprovePost = usePluginAction("unapprove-post");
-
-  const refresh = useCallback(() => setRefreshKey((k) => k + 1), []);
-
-  const handleApprove = useCallback(async (postId: string) => {
-    await approvePost({ postId, companyId });
-    refresh();
-  }, [approvePost, companyId, refresh]);
-
-  const handleUnapprove = useCallback(async (postId: string) => {
-    await unapprovePost({ postId, companyId });
-    refresh();
-  }, [unapprovePost, companyId, refresh]);
-
-  const handleGenerateBatch = useCallback(async () => {
-    setGenerating(true);
-    setGenerateError(null);
-    try {
-      await generateBatch({ companyId, daysCount: 10 });
-      refresh();
-    } catch (err) {
-      setGenerateError(err instanceof Error ? err.message : "Failed to generate batch");
-    } finally {
-      setGenerating(false);
-    }
-  }, [generateBatch, companyId, refresh]);
-
-  const calendar = calendarData.data?.calendar ?? [];
-  const stats = statsData.data;
-
-  return (
-    <div style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif", color: tokens.fg }}>
-      {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 12 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700 }}>Content Calendar</h2>
-          <p style={{ margin: "4px 0 0 0", fontSize: 14, color: tokens.muted }}>
-            Schedule and manage your X (Twitter) posts
-          </p>
-        </div>
-
-        <button
-          onClick={handleGenerateBatch}
-          disabled={generating}
-          style={{
-            padding: "10px 20px",
-            background: "oklch(0.35 0.12 280)",
-            border: `1px solid oklch(0.5 0.15 280)`,
-            borderRadius: 8,
-            color: "oklch(0.92 0.1 280)",
-            fontSize: 14,
-            fontWeight: 600,
-            cursor: generating ? "not-allowed" : "pointer",
-            opacity: generating ? 0.7 : 1,
-            whiteSpace: "nowrap",
-          }}
-        >
-          {generating ? "Generating…" : "✨ Generate 10 Posts"}
-        </button>
-      </div>
-
-      {generateError && (
-        <div style={{
-          padding: "10px 14px",
-          background: "oklch(0.2 0.06 25)",
-          border: `1px solid oklch(0.4 0.15 25)`,
-          borderRadius: 8,
-          color: "oklch(0.82 0.13 25)",
-          fontSize: 13,
-          marginBottom: 16,
-        }}>
-          {generateError}
-        </div>
-      )}
-
-      {/* Stats */}
-      {stats && (
-        <div style={{ display: "flex", gap: 12, marginBottom: 24, flexWrap: "wrap" }}>
-          {[
-            { label: "Total", value: stats.total, color: tokens.muted },
-            { label: "Draft", value: stats.draft, color: "oklch(0.7 0.1 250)" },
-            { label: "Approved", value: stats.approved, color: "oklch(0.7 0.12 145)" },
-            { label: "Posted", value: stats.posted, color: "oklch(0.65 0.16 145)" },
-            { label: "Failed", value: stats.failed, color: "oklch(0.7 0.15 25)" },
-          ].map((stat) => (
-            <div
-              key={stat.label}
-              style={{
-                background: tokens.card,
-                border: `1px solid ${tokens.border}`,
-                borderRadius: 8,
-                padding: "10px 16px",
-                minWidth: 80,
-                textAlign: "center",
-              }}
-            >
-              <div style={{ fontSize: 22, fontWeight: 700, color: stat.color }}>{stat.value}</div>
-              <div style={{ fontSize: 12, color: tokens.muted }}>{stat.label}</div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Calendar grid */}
-      {calendarData.loading && (
-        <div style={{ textAlign: "center", color: tokens.muted, padding: "40px 0" }}>Loading calendar…</div>
-      )}
-
-      {calendarData.error && (
-        <div style={{ color: "oklch(0.82 0.13 25)", padding: "16px 0" }}>
-          Failed to load calendar: {String(calendarData.error)}
-        </div>
-      )}
-
-      {!calendarData.loading && calendar.length > 0 && (
-        <div style={{ display: "flex", gap: 12, overflowX: "auto", paddingBottom: 16 }}>
-          {calendar.map((day) => (
-            <DayColumn
-              key={day.date}
-              day={day}
-              onEdit={setEditingPost}
-              onApprove={handleApprove}
-              onUnapprove={handleUnapprove}
-            />
-          ))}
-        </div>
-      )}
-
-      {/* Post editor modal */}
-      {editingPost && (
-        <PostEditor
-          post={editingPost}
-          companyId={companyId}
-          onClose={() => setEditingPost(null)}
-          onSaved={() => {
-            setEditingPost(null);
-            refresh();
-          }}
-        />
-      )}
+      <div style={{ fontWeight: 600, marginBottom: 6 }}>{title}</div>
+      <div style={{ fontSize: 12, color: "#a1a1aa", lineHeight: 1.6 }}>{body}</div>
     </div>
   );
 }

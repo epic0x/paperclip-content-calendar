@@ -1,9 +1,10 @@
 {
-  "name": "@paperclipai/plugin-content-calendar",
-  "version": "0.1.0",
-  "description": "Content calendar plugin for scheduling and posting to X (Twitter)",
+  "name": "@untrace/paperclip-plugin-content-calendar",
+  "version": "0.2.0",
+  "description": "Content calendar and publish scheduler for Paperclip. Reads social_post cases, renders them on a month grid, and publishes approved cases when due.",
   "type": "module",
   "private": true,
+  "license": "MIT",
   "files": [
     "dist",
     "migrations",
@@ -18,14 +19,14 @@
     "ui": "./dist/ui/"
   },
   "scripts": {
-    "prebuild": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps",
     "build": "node ./esbuild.config.mjs",
     "dev": "node ./esbuild.config.mjs --watch",
-    "typecheck": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:namespace": "node ./scripts/verify-namespace.mjs",
+    "test": "node --test test/"
   },
   "dependencies": {
-    "@paperclipai/plugin-sdk": "workspace:*",
-    "zod": "^3.23.0"
+    "@paperclipai/plugin-sdk": "2026.821.0-canary.11"
   },
   "devDependencies": {
     "@types/node": "^24.6.0",
@@ -38,5 +39,8 @@
   },
   "peerDependencies": {
     "react": ">=18"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

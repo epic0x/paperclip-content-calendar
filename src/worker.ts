@@ -1,561 +1,443 @@
-import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   definePlugin,
   runWorker,
   type PluginContext,
-  type PluginEvent,
   type PluginJobContext,
 } from "@paperclipai/plugin-sdk";
 import {
-  CONTENT_PROJECT_KEY,
-  JOB_KEY_DAILY_POST_CHECK,
+  DB_NAMESPACE,
+  JOB_PUBLISH_DUE,
   PLUGIN_ID,
 } from "./manifest.js";
+import {
+  CasesNotConfiguredError,
+  listSocialCases,
+  patchCaseFields,
+  readConfig,
+  type CalendarConfig,
+  type CalendarEntry,
+} from "./cases.js";
+import { adapterFor } from "./channels.js";
+import { evaluate } from "./gate.js";
 
 // ---------------------------------------------------------------------------
-// Types
+// Small helpers
 // ---------------------------------------------------------------------------
 
-type Post = {
-  id: string;
-  company_id: string;
-  issue_id: string | null;
-  platform: string;
-  content: string;
-  scheduled_date: string;
-  scheduled_time: string | null;
-  status: string;
-  posted_at: string | null;
-  post_url: string | null;
-  error_message: string | null;
-  metadata: Record<string, unknown>;
-  created_by: string | null;
-  created_at: string;
-  updated_at: string;
-};
+const attempts = () => `${DB_NAMESPACE}.publish_attempts`;
+const overrides = () => `${DB_NAMESPACE}.schedule_overrides`;
 
-type CalendarDay = {
-  date: string;
-  posts: Post[];
-};
-
-type PostStats = {
-  total: number;
-  draft: number;
-  approved: number;
-  posted: number;
-  failed: number;
-  cancelled: number;
-};
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function postsTable(namespace: string): string {
-  return `${namespace}.posts`;
+function sha256(s: string): string {
+  return createHash("sha256").update(s).digest("hex");
 }
 
-function batchesTable(namespace: string): string {
-  return `${namespace}.batches`;
+function requireStr(v: unknown, name: string): string {
+  if (typeof v !== "string" || !v.trim()) throw new Error(`${name} is required`);
+  return v.trim();
 }
 
-function strField(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+/** YYYY-MM-DD in UTC. The calendar grid is UTC; channel-local time is a later concern. */
+function dayKey(iso: string): string {
+  return new Date(iso).toISOString().slice(0, 10);
 }
 
-function requireStr(value: unknown, name: string): string {
-  const s = strField(value);
-  if (!s) throw new Error(`${name} is required`);
-  return s;
+async function sentCaseIds(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<Set<string>> {
+  const rows = await ctx.db.query<{ case_id: string }>(
+    `SELECT case_id FROM ${attempts()} WHERE company_id = $1 AND outcome = 'sent'`,
+    [companyId],
+  );
+  return new Set(rows.map((r) => r.case_id));
 }
 
-async function runXPost(content: string): Promise<{ success: boolean; url: string | null; error: string | null }> {
-  return new Promise((resolve) => {
-    const scriptPath = "/root/.openclaw/workspace/skills/x-api/scripts/x-post.mjs";
-    const child = spawn("node", [scriptPath, content], {
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 60000,
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", (chunk: Buffer) => { stdout += String(chunk); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += String(chunk); });
-
-    child.on("close", (code) => {
-      if (code === 0) {
-        // Try to extract URL from stdout
-        const urlMatch = stdout.match(/https:\/\/(?:twitter|x)\.com\/\S+/);
-        resolve({ success: true, url: urlMatch ? urlMatch[0] : null, error: null });
-      } else {
-        resolve({ success: false, url: null, error: stderr.trim() || stdout.trim() || `Exit code ${code}` });
-      }
-    });
-
-    child.on("error", (err) => {
-      resolve({ success: false, url: null, error: err.message });
-    });
-  });
+async function recordAttempt(
+  ctx: PluginContext,
+  row: {
+    companyId: string;
+    entry: CalendarEntry;
+    outcome: string;
+    reason: string | null;
+    postUrl: string | null;
+    raw: Record<string, unknown>;
+  },
+): Promise<void> {
+  const { companyId, entry, outcome, reason, postUrl, raw } = row;
+  try {
+    await ctx.db.execute(
+      `INSERT INTO ${attempts()}
+         (company_id, case_id, case_identifier, case_key, channel,
+          scheduled_for, outcome, reason, post_url, content_sha256, adapter_response)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [
+        companyId,
+        entry.id,
+        entry.identifier,
+        entry.key,
+        entry.channel ?? "unknown",
+        entry.publishAt ?? new Date().toISOString(),
+        outcome,
+        reason,
+        postUrl,
+        entry.caption ? sha256(entry.caption) : null,
+        JSON.stringify(raw),
+      ],
+    );
+  } catch (err) {
+    // The partial unique index on outcome='sent' is the double-post interlock.
+    // A violation here means something else already published this case, which
+    // is exactly the outcome we want — log it, never retry the send.
+    ctx.logger.warn(
+      `[content-calendar] could not record ${outcome} for ${entry.identifier}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Data handlers
+// Data handlers — these back usePluginData() in the UI
 // ---------------------------------------------------------------------------
 
 async function registerDataHandlers(ctx: PluginContext): Promise<void> {
-  // calendar — returns posts grouped by date for the next N days
+  /**
+   * calendar — every social_post case grouped by UTC day.
+   * Params: companyId, from (YYYY-MM-DD), to (YYYY-MM-DD)
+   */
   ctx.data.register("calendar", async (params) => {
     const companyId = requireStr(params.companyId, "companyId");
-    const days = typeof params.days === "number" ? Math.min(params.days, 60) : 14;
+    const cfg = await readConfig(ctx, companyId);
 
-    const posts = await ctx.db.query<Post>(
-      `SELECT id, company_id, issue_id, platform, content, scheduled_date::text AS scheduled_date,
-              scheduled_time::text AS scheduled_time, status, posted_at::text AS posted_at,
-              post_url, error_message, metadata, created_by,
-              created_at::text AS created_at, updated_at::text AS updated_at
-       FROM ${postsTable(ctx.db.namespace)}
-       WHERE company_id = $1
-         AND scheduled_date >= CURRENT_DATE
-         AND scheduled_date < CURRENT_DATE + INTERVAL '${days} days'
-         AND status != 'cancelled'
-       ORDER BY scheduled_date ASC, scheduled_time ASC NULLS LAST, created_at ASC`,
-      [companyId],
+    let entries: CalendarEntry[];
+    try {
+      entries = await listSocialCases(ctx, cfg, companyId);
+    } catch (err) {
+      if (err instanceof CasesNotConfiguredError) {
+        return { configured: false, error: err.message, days: [], unscheduled: [], stats: null };
+      }
+      throw err;
+    }
+
+    const from = typeof params.from === "string" ? params.from : null;
+    const to = typeof params.to === "string" ? params.to : null;
+
+    const scheduled = entries.filter((e) => e.publishAt);
+    const unscheduled = entries.filter(
+      (e) => !e.publishAt && e.status !== "cancelled",
     );
 
-    // Group by date
-    const byDate = new Map<string, Post[]>();
-    for (const post of posts) {
-      const dateStr = post.scheduled_date;
-      if (!byDate.has(dateStr)) byDate.set(dateStr, []);
-      byDate.get(dateStr)!.push(post);
+    const byDay = new Map<string, CalendarEntry[]>();
+    for (const e of scheduled) {
+      const day = dayKey(e.publishAt as string);
+      if (from && day < from) continue;
+      if (to && day > to) continue;
+      const list = byDay.get(day) ?? [];
+      list.push(e);
+      byDay.set(day, list);
     }
 
-    // Build calendar days array covering the range
-    const calendar: CalendarDay[] = [];
-    const today = new Date();
-    for (let i = 0; i < days; i++) {
-      const d = new Date(today);
-      d.setDate(today.getDate() + i);
-      const dateStr = d.toISOString().slice(0, 10);
-      calendar.push({ date: dateStr, posts: byDate.get(dateStr) ?? [] });
-    }
+    const days = [...byDay.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, items]) => ({
+        date,
+        entries: items.sort((a, b) =>
+          (a.publishAt ?? "").localeCompare(b.publishAt ?? ""),
+        ),
+      }));
 
-    return { calendar, totalPosts: posts.length };
+    const stats = {
+      total: entries.length,
+      scheduled: scheduled.length,
+      unscheduled: unscheduled.length,
+      approved: entries.filter((e) => e.approved).length,
+      inReview: entries.filter((e) => e.status === "in_review").length,
+      published: entries.filter((e) => e.publishUrl).length,
+      cancelled: entries.filter((e) => e.status === "cancelled").length,
+    };
+
+    return { configured: true, error: null, days, unscheduled, stats };
   });
 
-  // post — returns a single post by ID
-  ctx.data.register("post", async (params) => {
-    const postId = requireStr(params.postId, "postId");
+  /** attempts — recent publish attempts, newest first. */
+  ctx.data.register("attempts", async (params) => {
     const companyId = requireStr(params.companyId, "companyId");
-
-    const rows = await ctx.db.query<Post>(
-      `SELECT id, company_id, issue_id, platform, content, scheduled_date::text AS scheduled_date,
-              scheduled_time::text AS scheduled_time, status, posted_at::text AS posted_at,
-              post_url, error_message, metadata, created_by,
-              created_at::text AS created_at, updated_at::text AS updated_at
-       FROM ${postsTable(ctx.db.namespace)}
-       WHERE id = $1 AND company_id = $2`,
-      [postId, companyId],
-    );
-
-    return rows[0] ?? null;
-  });
-
-  // stats — posting stats
-  ctx.data.register("stats", async (params) => {
-    const companyId = requireStr(params.companyId, "companyId");
-
-    const rows = await ctx.db.query<{ status: string; count: string }>(
-      `SELECT status, COUNT(*)::text AS count
-       FROM ${postsTable(ctx.db.namespace)}
-       WHERE company_id = $1
-       GROUP BY status`,
+    const limit =
+      typeof params.limit === "number" ? Math.min(params.limit, 200) : 50;
+    const rows = await ctx.db.query(
+      `SELECT case_identifier, channel, scheduled_for::text AS scheduled_for,
+              attempted_at::text AS attempted_at, outcome, reason, post_url
+         FROM ${attempts()}
+        WHERE company_id = $1
+        ORDER BY attempted_at DESC
+        LIMIT ${limit}`,
       [companyId],
     );
+    return { attempts: rows };
+  });
 
-    const stats: PostStats = { total: 0, draft: 0, approved: 0, posted: 0, failed: 0, cancelled: 0 };
-    for (const row of rows) {
-      const count = parseInt(row.count, 10);
-      stats.total += count;
-      const key = row.status as keyof PostStats;
-      if (key in stats) stats[key] = count;
-    }
-
-    return stats;
+  /** status — config health, so the UI can explain itself instead of rendering empty. */
+  ctx.data.register("status", async (params) => {
+    const companyId =
+      typeof params.companyId === "string" ? params.companyId : undefined;
+    const cfg = await readConfig(ctx, companyId);
+    const channels = await Promise.all(
+      cfg.channels.map(async (c) => {
+        const a = adapterFor(c);
+        return {
+          channel: c,
+          hasAdapter: Boolean(a),
+          configured: a ? await a.isConfigured(ctx, cfg) : false,
+        };
+      }),
+    );
+    return {
+      pluginId: PLUGIN_ID,
+      apiBaseUrl: cfg.apiBaseUrl,
+      boardKeyConfigured: Boolean(cfg.boardApiKeyRef),
+      autoPost: cfg.autoPost,
+      lookbackHours: cfg.lookbackHours,
+      channels,
+    };
   });
 }
 
 // ---------------------------------------------------------------------------
-// Action handlers
+// Actions — these back usePluginAction() in the UI
 // ---------------------------------------------------------------------------
 
 async function registerActionHandlers(ctx: PluginContext): Promise<void> {
-  // approve-post
-  ctx.actions.register("approve-post", async (params) => {
-    const postId = requireStr(params.postId, "postId");
+  /**
+   * reschedule — move a case to a new publish_at.
+   * Records intent first, then writes back, so a failed write-back is visible.
+   */
+  ctx.actions.register("reschedule", async (params) => {
     const companyId = requireStr(params.companyId, "companyId");
-
-    await ctx.db.execute(
-      `UPDATE ${postsTable(ctx.db.namespace)}
-       SET status = 'approved', updated_at = NOW()
-       WHERE id = $1 AND company_id = $2 AND status = 'draft'`,
-      [postId, companyId],
-    );
-
-    const rows = await ctx.db.query<Post>(
-      `SELECT id, status FROM ${postsTable(ctx.db.namespace)} WHERE id = $1`,
-      [postId],
-    );
-
-    await ctx.activity.log({
-      companyId,
-      entityType: "post",
-      entityId: postId,
-      message: `Post approved for publishing`,
-      metadata: { plugin: PLUGIN_ID },
-    });
-
-    return rows[0] ?? { id: postId, status: "approved" };
-  });
-
-  // unapprove-post
-  ctx.actions.register("unapprove-post", async (params) => {
-    const postId = requireStr(params.postId, "postId");
-    const companyId = requireStr(params.companyId, "companyId");
-
-    await ctx.db.execute(
-      `UPDATE ${postsTable(ctx.db.namespace)}
-       SET status = 'draft', updated_at = NOW()
-       WHERE id = $1 AND company_id = $2 AND status = 'approved'`,
-      [postId, companyId],
-    );
-
-    return { id: postId, status: "draft" };
-  });
-
-  // reschedule-post
-  ctx.actions.register("reschedule-post", async (params) => {
-    const postId = requireStr(params.postId, "postId");
-    const companyId = requireStr(params.companyId, "companyId");
-    const newDate = requireStr(params.newDate, "newDate");
-    const newTime = strField(params.newTime);
-
-    await ctx.db.execute(
-      `UPDATE ${postsTable(ctx.db.namespace)}
-       SET scheduled_date = $3, scheduled_time = $4, updated_at = NOW()
-       WHERE id = $1 AND company_id = $2 AND status IN ('draft', 'approved')`,
-      [postId, companyId, newDate, newTime],
-    );
-
-    await ctx.activity.log({
-      companyId,
-      entityType: "post",
-      entityId: postId,
-      message: `Post rescheduled to ${newDate}${newTime ? ` at ${newTime}` : ""}`,
-      metadata: { plugin: PLUGIN_ID },
-    });
-
-    return { id: postId, scheduled_date: newDate, scheduled_time: newTime };
-  });
-
-  // cancel-post
-  ctx.actions.register("cancel-post", async (params) => {
-    const postId = requireStr(params.postId, "postId");
-    const companyId = requireStr(params.companyId, "companyId");
-
-    await ctx.db.execute(
-      `UPDATE ${postsTable(ctx.db.namespace)}
-       SET status = 'cancelled', updated_at = NOW()
-       WHERE id = $1 AND company_id = $2 AND status IN ('draft', 'approved')`,
-      [postId, companyId],
-    );
-
-    return { id: postId, status: "cancelled" };
-  });
-
-  // edit-post
-  ctx.actions.register("edit-post", async (params) => {
-    const postId = requireStr(params.postId, "postId");
-    const companyId = requireStr(params.companyId, "companyId");
-    const content = requireStr(params.content, "content");
-
-    if (content.length > 280) {
-      throw new Error("Post content exceeds 280 characters (X/Twitter limit)");
+    const identifier = requireStr(params.caseIdentifier, "caseIdentifier");
+    const caseId = requireStr(params.caseId, "caseId");
+    const publishAt = requireStr(params.publishAt, "publishAt");
+    if (Number.isNaN(Date.parse(publishAt))) {
+      throw new Error(`publishAt is not a valid instant: ${publishAt}`);
     }
+    const previous =
+      typeof params.previousPublishAt === "string"
+        ? params.previousPublishAt
+        : null;
+
+    const cfg = await readConfig(ctx, companyId);
 
     await ctx.db.execute(
-      `UPDATE ${postsTable(ctx.db.namespace)}
-       SET content = $3, updated_at = NOW()
-       WHERE id = $1 AND company_id = $2 AND status IN ('draft', 'approved')`,
-      [postId, companyId, content],
+      `INSERT INTO ${overrides()}
+         (company_id, case_id, case_identifier, previous_publish_at,
+          requested_publish_at, requested_by)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [companyId, caseId, identifier, previous, publishAt, "calendar-ui"],
     );
 
-    return { id: postId, content };
-  });
-
-  // generate-batch — creates 10 posts for the next 10 days
-  ctx.actions.register("generate-batch", async (params) => {
-    const companyId = requireStr(params.companyId, "companyId");
-    const topic = strField(params.topic) ?? "company updates";
-    const daysCount = typeof params.daysCount === "number" ? Math.min(params.daysCount, 30) : 10;
-
-    // Get the managed project ID
-    const projects = await ctx.projects.list({ companyId, limit: 200, offset: 0 });
-    const contentProject = projects.find((p) => p.name === "Content Calendar");
-
-    // Create a batch record
-    const batchRows = await ctx.db.query<{ id: string }>(
-      `INSERT INTO ${batchesTable(ctx.db.namespace)} (company_id, days_count, status)
-       VALUES ($1, $2, 'generated')
-       RETURNING id`,
-      [companyId, daysCount],
-    );
-    const batchId = batchRows[0]?.id;
-
-    const today = new Date();
-    const createdPosts: Array<{ id: string; date: string; content: string }> = [];
-
-    // Generate sample posts for each day
-    const postTemplates = [
-      `🚀 Exciting updates from our team today! We're making great progress on our goals. Stay tuned for more details. #startup #progress`,
-      `💡 Did you know? Our team is constantly innovating to bring you better solutions. Here's what we've been working on. #innovation`,
-      `🎯 Focus is key to success. Our team is laser-focused on delivering value every single day. What are you working on today? #productivity`,
-      `✨ Great things take time. We're building something special and can't wait to share it with you. #building #startup`,
-      `🤝 Teamwork makes the dream work! Shoutout to our incredible team for their dedication and hard work. #team #culture`,
-      `📊 Progress update: we're hitting our milestones and staying on track. Small wins add up to big victories! #goals #metrics`,
-      `🌟 The best investment you can make is in yourself. Our team never stops learning and growing. #learning #growth`,
-      `💪 Challenges are opportunities in disguise. Our team tackles every obstacle head-on. #resilience #startup`,
-      `🔥 We're hiring! If you're passionate about what we do, come join our amazing team. Check the link in bio. #hiring #jobs`,
-      `🎉 Celebrating a milestone today! Every step forward matters. Thank you to everyone who has supported us on this journey. #milestone`,
-    ];
-
-    for (let i = 0; i < daysCount; i++) {
-      const scheduledDate = new Date(today);
-      scheduledDate.setDate(today.getDate() + i + 1);
-      const dateStr = scheduledDate.toISOString().slice(0, 10);
-
-      const template = postTemplates[i % postTemplates.length] ?? postTemplates[0]!;
-      const content = template;
-
-      // Insert post into DB
-      const postRows = await ctx.db.query<{ id: string }>(
-        `INSERT INTO ${postsTable(ctx.db.namespace)}
-         (company_id, platform, content, scheduled_date, status, metadata)
-         VALUES ($1, 'x', $2, $3, 'draft', $4::jsonb)
-         RETURNING id`,
-        [companyId, content, dateStr, JSON.stringify({ batchId, topic, dayIndex: i })],
+    try {
+      await patchCaseFields(ctx, cfg, identifier, { publish_at: publishAt });
+      await ctx.db.execute(
+        `UPDATE ${overrides()}
+            SET applied_to_case = TRUE, updated_at = NOW()
+          WHERE case_id = $1 AND requested_publish_at = $2`,
+        [caseId, publishAt],
       );
-      const postId = postRows[0]?.id;
-
-      if (postId) {
-        createdPosts.push({ id: postId, date: dateStr, content });
-
-        // Create an issue in the managed project if it exists
-        if (contentProject) {
-          try {
-            const issue = await ctx.issues.create({
-              companyId,
-              projectId: contentProject.id,
-              title: `Post for ${dateStr}: ${content.slice(0, 60)}...`,
-              description: `**Scheduled Date:** ${dateStr}\n**Platform:** X (Twitter)\n**Status:** Draft\n\n**Content:**\n${content}\n\n**Post ID:** ${postId}`,
-            });
-
-            // Link issue to post
-            await ctx.db.execute(
-              `UPDATE ${postsTable(ctx.db.namespace)} SET issue_id = $2 WHERE id = $1`,
-              [postId, issue.id],
-            );
-          } catch (err) {
-            ctx.logger.warn(`Failed to create issue for post ${postId}: ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
-      }
+      return { ok: true, publishAt };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await ctx.db.execute(
+        `UPDATE ${overrides()}
+            SET apply_error = $3, updated_at = NOW()
+          WHERE case_id = $1 AND requested_publish_at = $2`,
+        [caseId, publishAt, message],
+      );
+      throw err;
     }
-
-    await ctx.activity.log({
-      companyId,
-      message: `Generated batch of ${createdPosts.length} posts for the next ${daysCount} days`,
-      metadata: { plugin: PLUGIN_ID, batchId, topic },
-    });
-
-    await ctx.metrics.write("content_calendar.batch_generated", 1, {
-      days_count: String(daysCount),
-      posts_created: String(createdPosts.length),
-    });
-
-    return {
-      batchId,
-      postsCreated: createdPosts.length,
-      posts: createdPosts,
-    };
   });
 
-  // create-post — create a single post manually
-  ctx.actions.register("create-post", async (params) => {
+  /** run-publish-now — fire the publish sweep on demand. Same gate applies. */
+  ctx.actions.register("run-publish-now", async (params) => {
     const companyId = requireStr(params.companyId, "companyId");
-    const content = requireStr(params.content, "content");
-    const scheduledDate = requireStr(params.scheduledDate, "scheduledDate");
-    const scheduledTime = strField(params.scheduledTime);
-    const platform = strField(params.platform) ?? "x";
-
-    if (content.length > 280) {
-      throw new Error("Post content exceeds 280 characters (X/Twitter limit)");
-    }
-
-    const rows = await ctx.db.query<{ id: string }>(
-      `INSERT INTO ${postsTable(ctx.db.namespace)}
-       (company_id, platform, content, scheduled_date, scheduled_time, status)
-       VALUES ($1, $2, $3, $4, $5, 'draft')
-       RETURNING id`,
-      [companyId, platform, content, scheduledDate, scheduledTime],
-    );
-
-    const postId = rows[0]?.id;
-    if (!postId) throw new Error("Failed to create post");
-
-    await ctx.activity.log({
-      companyId,
-      entityType: "post",
-      entityId: postId,
-      message: `New post created for ${scheduledDate}`,
-      metadata: { plugin: PLUGIN_ID },
-    });
-
-    return { id: postId, content, scheduledDate, status: "draft" };
+    return await publishSweep(ctx, companyId, "manual");
   });
 }
 
 // ---------------------------------------------------------------------------
-// Job handlers
+// The publish sweep
+// ---------------------------------------------------------------------------
+
+interface SweepSummary {
+  companyId: string;
+  trigger: string;
+  evaluated: number;
+  published: number;
+  dryRun: number;
+  failed: number;
+  skipped: number;
+  autoPost: boolean;
+  details: Array<{ case: string; outcome: string; reason: string }>;
+}
+
+async function publishSweep(
+  ctx: PluginContext,
+  companyId: string,
+  trigger: string,
+): Promise<SweepSummary> {
+  const cfg: CalendarConfig = await readConfig(ctx, companyId);
+  const summary: SweepSummary = {
+    companyId,
+    trigger,
+    evaluated: 0,
+    published: 0,
+    dryRun: 0,
+    failed: 0,
+    skipped: 0,
+    autoPost: cfg.autoPost,
+    details: [],
+  };
+
+  let entries: CalendarEntry[];
+  try {
+    entries = await listSocialCases(ctx, cfg, companyId);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    ctx.logger.error(`[content-calendar] cannot read cases: ${message}`);
+    return summary;
+  }
+
+  const sent = await sentCaseIds(ctx, companyId);
+  const now = new Date();
+  const enabled = cfg.channels.map((c) => c.toLowerCase());
+
+  for (const entry of entries) {
+    // Cheap pre-filter: only cases that could conceivably go out today.
+    if (!entry.publishAt || entry.status === "cancelled" || entry.status === "done") {
+      continue;
+    }
+    summary.evaluated += 1;
+
+    const adapter = adapterFor(entry.channel);
+    const adapterReady = adapter
+      ? await adapter.isConfigured(ctx, cfg)
+      : false;
+
+    const decision = evaluate({
+      entry,
+      now,
+      autoPost: cfg.autoPost,
+      enabledChannels: enabled,
+      lookbackHours: cfg.lookbackHours,
+      alreadySent: sent.has(entry.id),
+      adapterReady,
+    });
+
+    if (decision.outcome === "skipped") {
+      summary.skipped += 1;
+      // Only persist interesting skips — "not due yet" would flood the table
+      // every 15 minutes for every future post.
+      if (decision.reason !== "not due yet") {
+        summary.details.push({
+          case: entry.identifier,
+          outcome: "skipped",
+          reason: decision.reason,
+        });
+      }
+      continue;
+    }
+
+    if (decision.outcome === "dry_run") {
+      summary.dryRun += 1;
+      summary.details.push({
+        case: entry.identifier,
+        outcome: "dry_run",
+        reason: decision.reason,
+      });
+      await recordAttempt(ctx, {
+        companyId,
+        entry,
+        outcome: "dry_run",
+        reason: decision.reason,
+        postUrl: null,
+        raw: { autoPost: false },
+      });
+      continue;
+    }
+
+    // decision.outcome === "publish"
+    const result = await (adapter as NonNullable<typeof adapter>).publish(ctx, cfg, {
+      entry,
+      caption: entry.caption as string,
+      mediaFile: entry.mediaFile,
+    });
+
+    if (result.ok && result.url) {
+      await recordAttempt(ctx, {
+        companyId,
+        entry,
+        outcome: "sent",
+        reason: null,
+        postUrl: result.url,
+        raw: result.raw,
+      });
+      // Write the URL back onto the case, merged — never a bare field patch.
+      try {
+        await patchCaseFields(ctx, cfg, entry.identifier, {
+          publish_url: result.url,
+        });
+      } catch (err) {
+        ctx.logger.warn(
+          `[content-calendar] published ${entry.identifier} but could not write publish_url back: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      summary.published += 1;
+      summary.details.push({
+        case: entry.identifier,
+        outcome: "sent",
+        reason: result.url,
+      });
+      await ctx.activity.log({
+        companyId,
+        message: `Published ${entry.identifier} to ${entry.channel}: ${result.url}`,
+        entityType: "case",
+        entityId: entry.id,
+        metadata: { channel: entry.channel, url: result.url },
+      });
+    } else {
+      await recordAttempt(ctx, {
+        companyId,
+        entry,
+        outcome: "failed",
+        reason: result.error ?? "adapter returned no url",
+        postUrl: null,
+        raw: result.raw,
+      });
+      summary.failed += 1;
+      summary.details.push({
+        case: entry.identifier,
+        outcome: "failed",
+        reason: result.error ?? "adapter returned no url",
+      });
+    }
+  }
+
+  ctx.logger.info(
+    `[content-calendar] sweep(${trigger}) company=${companyId} evaluated=${summary.evaluated} sent=${summary.published} dry_run=${summary.dryRun} failed=${summary.failed} skipped=${summary.skipped} autoPost=${cfg.autoPost}`,
+  );
+  return summary;
+}
+
+// ---------------------------------------------------------------------------
+// Jobs
 // ---------------------------------------------------------------------------
 
 async function registerJobs(ctx: PluginContext): Promise<void> {
-  ctx.jobs.register(JOB_KEY_DAILY_POST_CHECK, async (job: PluginJobContext) => {
-    ctx.logger.info(`[content-calendar] Daily post check job started`, { runId: job.runId });
-
-    // Get all companies
-    const companies = await ctx.companies.list({ limit: 200, offset: 0 });
-    const results: Array<{
-      companyId: string;
-      postId: string;
-      status: "posted" | "failed";
-      error?: string;
-    }> = [];
-
+  ctx.jobs.register(JOB_PUBLISH_DUE, async (job: PluginJobContext) => {
+    const companies = await ctx.companies.list();
     for (const company of companies) {
-      const companyId = company.id;
-
-      // Find approved posts scheduled for today
-      const todayPosts = await ctx.db.query<Post>(
-        `SELECT id, content, platform
-         FROM ${postsTable(ctx.db.namespace)}
-         WHERE company_id = $1
-           AND status = 'approved'
-           AND scheduled_date = CURRENT_DATE`,
-        [companyId],
-      );
-
-      ctx.logger.info(`[content-calendar] Found ${todayPosts.length} posts to publish for company ${companyId}`);
-
-      for (const post of todayPosts) {
-        try {
-          const result = await runXPost(post.content);
-
-          if (result.success) {
-            await ctx.db.execute(
-              `UPDATE ${postsTable(ctx.db.namespace)}
-               SET status = 'posted', posted_at = NOW(), post_url = $2, updated_at = NOW()
-               WHERE id = $1`,
-              [post.id, result.url],
-            );
-
-            results.push({ companyId, postId: post.id, status: "posted" });
-            await ctx.metrics.write("content_calendar.post_published", 1, { platform: post.platform });
-          } else {
-            await ctx.db.execute(
-              `UPDATE ${postsTable(ctx.db.namespace)}
-               SET status = 'failed', error_message = $2, updated_at = NOW()
-               WHERE id = $1`,
-              [post.id, result.error],
-            );
-
-            results.push({ companyId, postId: post.id, status: "failed", error: result.error ?? undefined });
-            await ctx.metrics.write("content_calendar.post_failed", 1, { platform: post.platform });
-          }
-        } catch (err) {
-          const errorMessage = err instanceof Error ? err.message : String(err);
-          await ctx.db.execute(
-            `UPDATE ${postsTable(ctx.db.namespace)}
-             SET status = 'failed', error_message = $2, updated_at = NOW()
-             WHERE id = $1`,
-            [post.id, errorMessage],
-          );
-
-          results.push({ companyId, postId: post.id, status: "failed", error: errorMessage });
-        }
-      }
-    }
-
-    const posted = results.filter((r) => r.status === "posted").length;
-    const failed = results.filter((r) => r.status === "failed").length;
-
-    ctx.logger.info(`[content-calendar] Daily post check complete: ${posted} posted, ${failed} failed`);
-
-    return {
-      jobKey: job.jobKey,
-      runId: job.runId,
-      posted,
-      failed,
-      results,
-      completedAt: new Date().toISOString(),
-    };
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Event handlers
-// ---------------------------------------------------------------------------
-
-async function registerEventHandlers(ctx: PluginContext): Promise<void> {
-  // Sync issue status changes to post status
-  ctx.events.on("issue.updated", async (event: PluginEvent) => {
-    const payload = event.payload as { issueId?: string; status?: string; companyId?: string } | null;
-    if (!payload?.issueId || !payload?.companyId) return;
-
-    try {
-      // Find posts linked to this issue
-      const posts = await ctx.db.query<{ id: string; status: string }>(
-        `SELECT id, status FROM ${postsTable(ctx.db.namespace)}
-         WHERE issue_id = $1 AND company_id = $2`,
-        [payload.issueId, payload.companyId],
-      );
-
-      if (posts.length === 0) return;
-
-      // Map issue status to post status
-      const issueStatus = payload.status;
-      let newPostStatus: string | null = null;
-
-      if (issueStatus === "done") newPostStatus = "posted";
-      else if (issueStatus === "cancelled") newPostStatus = "cancelled";
-      else if (issueStatus === "in_progress") newPostStatus = "approved";
-
-      if (newPostStatus) {
-        for (const post of posts) {
-          if (post.status !== newPostStatus) {
-            await ctx.db.execute(
-              `UPDATE ${postsTable(ctx.db.namespace)}
-               SET status = $2, updated_at = NOW()
-               WHERE id = $1`,
-              [post.id, newPostStatus],
-            );
-          }
-        }
-      }
-    } catch (err) {
-      ctx.logger.warn(`[content-calendar] Failed to sync issue status: ${err instanceof Error ? err.message : String(err)}`);
+      await publishSweep(ctx, company.id, `job:${job.jobKey}:${job.trigger}`);
     }
   });
 }
@@ -569,24 +451,32 @@ let activeContext: PluginContext | null = null;
 const plugin = definePlugin({
   async setup(ctx) {
     activeContext = ctx;
-    ctx.logger.info("[content-calendar] Plugin setup starting");
-
-    await registerEventHandlers(ctx);
-    await registerJobs(ctx);
+    ctx.logger.info(`[content-calendar] setup starting (${PLUGIN_ID})`);
     await registerDataHandlers(ctx);
     await registerActionHandlers(ctx);
-
-    ctx.logger.info("[content-calendar] Plugin setup complete");
+    await registerJobs(ctx);
+    ctx.logger.info(
+      `[content-calendar] setup complete — namespace ${ctx.db.namespace}`,
+    );
+    if (ctx.db.namespace !== DB_NAMESPACE) {
+      ctx.logger.error(
+        `[content-calendar] NAMESPACE MISMATCH: host derived "${ctx.db.namespace}" but migrations are hardcoded to "${DB_NAMESPACE}". Every query will fail until these agree.`,
+      );
+    }
   },
 
   async onHealth() {
     const ctx = activeContext;
+    if (!ctx) {
+      return { status: "error" as const, message: "no active context" };
+    }
     return {
       status: "ok" as const,
-      message: "Content Calendar plugin ready",
+      message: "Content Calendar ready",
       details: {
-        hasContext: Boolean(ctx),
         pluginId: PLUGIN_ID,
+        namespace: ctx.db.namespace,
+        namespaceMatches: ctx.db.namespace === DB_NAMESPACE,
       },
     };
   },
