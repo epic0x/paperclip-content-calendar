@@ -12,7 +12,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
  * migration statement. If you must change them, recompute the namespace first.
  */
 export const PLUGIN_ID = "untrace.plugin-content-calendar";
-export const PLUGIN_VERSION = "0.2.3";
+export const PLUGIN_VERSION = "0.3.0";
 /** This private deployment serves the single Untrace Network company. */
 export const UNTRACE_COMPANY_ID = "b276d33f-a226-4fd1-95fa-b3f3114ccd9d";
 export const NAMESPACE_SLUG = "content_calendar";
@@ -40,6 +40,8 @@ export const FIELD_CHANNEL = "channel";
 export const FIELD_CAPTION = "caption";
 export const FIELD_PUBLISH_URL = "publish_url";
 export const FIELD_MEDIA = "media_file";
+/** Accessibility text for the attached image. X requires alt on every image. */
+export const FIELD_ALT = "alt_text";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,

@@ -30,13 +30,15 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Unit tests (publish gate)
+      - name: Unit tests (gate, time, attachments, cases, media, upload)
         run: npm test
 
       - name: Verify build output
         run: |
           set -eu
-          for f in dist/manifest.js dist/worker.js dist/ui/index.js dist/gate.js dist/time.js; do
+          for f in dist/manifest.js dist/worker.js dist/ui/index.js dist/gate.js \
+                   dist/time.js dist/attachments.js dist/cases.js dist/media.js \
+                   dist/ui/upload.js dist/ui/panel.js; do
             test -s "$f" || { echo "MISSING OR EMPTY: $f"; exit 1; }
             echo "ok: $f ($(wc -c < "$f") bytes)"
           done

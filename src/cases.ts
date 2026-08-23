@@ -12,8 +12,10 @@
  */
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { assetContentPath, assetRef, parseAssetRef } from "./attachments.js";
 import {
   CASE_TYPE,
+  FIELD_ALT,
   FIELD_CAPTION,
   FIELD_CHANNEL,
   FIELD_MEDIA,
@@ -42,6 +44,11 @@ export interface PaperclipCase {
   updatedAt?: string;
 }
 
+/** GET /api/cases/:id — the case row plus its links, labels and attachments. */
+export interface PaperclipCaseDetail extends PaperclipCase {
+  attachments?: RawAttachment[];
+}
+
 /** A case projected into what the calendar actually needs. */
 export interface CalendarEntry {
   id: string;
@@ -59,6 +66,53 @@ export interface CalendarEntry {
   altText: string | null;
   /** True when the case is in the native `approved` status. */
   approved: boolean;
+}
+
+/** One native attachment, projected into what the detail panel renders. */
+export interface AttachmentSummary {
+  /** case_attachments row id. */
+  id: string;
+  /** assets row id — the thing that actually holds the bytes. */
+  assetId: string;
+  /** Native content URL, session-authenticated and same-origin. */
+  contentPath: string;
+  contentType: string;
+  byteSize: number;
+  originalFilename: string | null;
+  createdAt: string | null;
+}
+
+/**
+ * A single case with everything the editor panel needs.
+ *
+ * Read ONLY when a card is selected. The month grid never asks for this: the
+ * case list endpoint returns no attachments, so projecting them onto every card
+ * would mean one extra API call per post on every render of the calendar.
+ */
+export interface CaseDetail extends CalendarEntry {
+  attachments: AttachmentSummary[];
+  /**
+   * The attachment `media_file` explicitly points at — NEVER a guess.
+   *
+   * Null whenever `media_file` is empty, is a legacy host path, or names an
+   * asset that is not attached to this case. Falling back to "the newest
+   * attachment" would show the operator an image the publish path is not going
+   * to send: publishing reads `media_file`, so anything else on screen is a
+   * claim the post cannot honour.
+   */
+  activeAttachment: AttachmentSummary | null;
+  /**
+   * Attachments the case carries that `media_file` does not point at.
+   *
+   * Reported as history so nothing looks lost, and deliberately kept apart from
+   * `activeAttachment` so the panel cannot label one of them "the post image".
+   */
+  unreferencedAttachments: AttachmentSummary[];
+  /**
+   * True when `media_file` is set but is not a native asset reference — an old
+   * host path. The panel says so rather than rendering a broken image.
+   */
+  legacyMediaFile: boolean;
 }
 
 export interface CalendarConfig {
@@ -245,11 +299,194 @@ export function toEntry(c: PaperclipCase): CalendarEntry {
     caption: str(fields[FIELD_CAPTION]),
     mediaFile: str(fields[FIELD_MEDIA]),
     publishUrl: str(fields[FIELD_PUBLISH_URL]),
-    altText: str(fields.alt_text),
+    altText: str(fields[FIELD_ALT]),
     // Approval is the NATIVE case status, never a JSON field. See
     // Agents/paperclip-native-scheduling.md in the knowledge graph.
     approved: c.status === "approved",
   };
+}
+
+interface RawAttachment {
+  id?: string;
+  createdAt?: string;
+  asset?: {
+    id?: string;
+    contentType?: string;
+    byteSize?: number;
+    originalFilename?: string | null;
+    createdAt?: string;
+  } | null;
+}
+
+function num(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+
+function toAttachment(raw: RawAttachment): AttachmentSummary | null {
+  const assetId = str(raw.asset?.id);
+  if (!assetId) return null;
+  return {
+    id: str(raw.id) ?? assetId,
+    assetId,
+    contentPath: assetContentPath(assetId),
+    contentType: str(raw.asset?.contentType) ?? "application/octet-stream",
+    byteSize: num(raw.asset?.byteSize),
+    originalFilename: str(raw.asset?.originalFilename),
+    createdAt: str(raw.createdAt) ?? str(raw.asset?.createdAt),
+  };
+}
+
+/**
+ * Project a case DETAIL response into what the editor panel renders.
+ *
+ * `attachments` only exists on GET /api/cases/:id — the list endpoint returns
+ * bare case rows — so this is the one shape that carries media metadata.
+ */
+export function toDetail(c: PaperclipCaseDetail): CaseDetail {
+  const entry = toEntry(c);
+  const attachments = (c.attachments ?? [])
+    .map(toAttachment)
+    .filter((a): a is AttachmentSummary => a !== null);
+
+  // `media_file` is the only thing that decides which image the post carries,
+  // because it is the only thing the publish path reads. No reference means no
+  // current image — not "probably the last one uploaded".
+  const referenced = parseAssetRef(entry.mediaFile);
+  const active =
+    (referenced ? attachments.find((a) => a.assetId === referenced) : null) ??
+    null;
+
+  return {
+    ...entry,
+    attachments,
+    activeAttachment: active,
+    unreferencedAttachments: attachments.filter((a) => a !== active),
+    legacyMediaFile: Boolean(entry.mediaFile) && referenced === null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// What the calendar panel may change
+// ---------------------------------------------------------------------------
+
+/**
+ * The statuses the panel's dropdown offers, in review order.
+ *
+ * These are NATIVE case statuses — the same field the Paperclip case page
+ * writes, emitting the same `status_changed` event. Publishing (`done`) and
+ * `in_progress` are deliberately absent: a case becomes done by being
+ * published, not by a dropdown.
+ *
+ * The worker validates against this same list, so the UI cannot offer a
+ * transition the worker would refuse.
+ */
+export const PANEL_STATUSES = [
+  "draft",
+  "in_review",
+  "approved",
+  "cancelled",
+] as const;
+
+export type PanelStatus = (typeof PANEL_STATUSES)[number];
+
+export function isPanelStatus(value: string): value is PanelStatus {
+  return (PANEL_STATUSES as readonly string[]).includes(value);
+}
+
+/**
+ * Guard before `media_file` is repointed.
+ *
+ * The browser uploads the bytes and the worker writes the field, so the worker
+ * re-reads the case and confirms the asset really is linked to it. Without this
+ * the action would happily point a case at any asset id a caller invented.
+ */
+export function assertAttachedAsset(
+  detail: CaseDetail,
+  assetId: string,
+): AttachmentSummary {
+  const found = detail.attachments.find((a) => a.assetId === assetId);
+  if (!found) {
+    throw new Error(
+      `asset ${assetId} is not attached to ${detail.identifier}; nothing was changed`,
+    );
+  }
+  return found;
+}
+
+/**
+ * The server-side line for a `set-media` that did not go through.
+ *
+ * The browser is handed the thrown message and nothing else, and the panel is
+ * usually closed within seconds of the failure. Whoever reads the worker log
+ * afterwards needs the case and the asset that were involved, or a repointing
+ * that failed leaves no trace of WHAT failed to point WHERE.
+ */
+export function describeSetMediaFailure(input: {
+  identifier: string;
+  assetId: string;
+  companyId: string;
+  err: unknown;
+}): string {
+  const reason =
+    input.err instanceof Error ? input.err.message : String(input.err);
+  const status =
+    input.err instanceof CasesApiError ? ` (HTTP ${input.err.status})` : "";
+  return (
+    `[content-calendar] set-media failed for case ${input.identifier} ` +
+    `asset ${input.assetId} company ${input.companyId}${status}: ${reason}`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Building patches
+//
+// Paperclip REPLACES `fields` wholesale on PATCH (see patchCaseFields), so the
+// merge happens there. These helpers only decide what a save is ASKING to
+// change: a key that is absent from the patch keeps whatever the case already
+// holds, which is why an unedited field must never appear here.
+// ---------------------------------------------------------------------------
+
+function trimmedOrNull(v: string | null | undefined): string | null {
+  const t = (v ?? "").trim();
+  return t.length > 0 ? t : null;
+}
+
+export interface ContentEdit {
+  caption?: string | null;
+  altText?: string | null;
+}
+
+/**
+ * The patch for a caption / alt-text save from the calendar panel.
+ *
+ * Only the keys the operator actually edited are included. An empty string is
+ * a deliberate clear and becomes null, which is what `toEntry` already reads
+ * back as "no caption".
+ */
+export function buildContentPatch(edit: ContentEdit): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  if (edit.caption !== undefined) patch[FIELD_CAPTION] = trimmedOrNull(edit.caption);
+  if (edit.altText !== undefined) patch[FIELD_ALT] = trimmedOrNull(edit.altText);
+  return patch;
+}
+
+/**
+ * The patch that makes a freshly uploaded asset the case's image.
+ *
+ * Written only AFTER the upload and the case_attachments link both succeeded,
+ * so a failed replacement leaves the previous image in place.
+ */
+export function buildMediaPatch(input: {
+  assetId: string;
+  altText?: string | null;
+}): Record<string, unknown> {
+  const patch: Record<string, unknown> = {
+    [FIELD_MEDIA]: assetRef(input.assetId),
+  };
+  if (input.altText !== undefined) {
+    patch[FIELD_ALT] = trimmedOrNull(input.altText);
+  }
+  return patch;
 }
 
 /**
@@ -283,6 +520,64 @@ export async function listSocialCases(
     );
   }
   return batch.map(toEntry);
+}
+
+/**
+ * Download an asset's bytes over the authenticated API.
+ *
+ * `GET /api/assets/:assetId/content` (server/dist/routes/assets.js) streams the
+ * object and sets Content-Type from the asset row. The board key is scoped to
+ * the company, and the route 404s rather than 403s across tenants, so a wrong
+ * id looks like a missing asset — which is exactly how the publish path treats
+ * it: a failed attempt with a reason, never a silent text-only post.
+ */
+export async function downloadAsset(
+  ctx: PluginContext,
+  cfg: CalendarConfig,
+  assetId: string,
+  companyId: string,
+): Promise<{ bytes: Uint8Array; contentType: string }> {
+  const url = `${cfg.apiBaseUrl}${assetContentPath(assetId)}`;
+  const res = await fetchFor(ctx, url)(url, {
+    method: "GET",
+    headers: { Authorization: await authHeader(ctx, cfg, companyId) },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new CasesApiError(
+      `GET /api/assets/${assetId}/content -> ${res.status}`,
+      res.status,
+      text.slice(0, 500),
+    );
+  }
+  return {
+    bytes: new Uint8Array(await res.arrayBuffer()),
+    contentType: res.headers.get("content-type") ?? "application/octet-stream",
+  };
+}
+
+/**
+ * Read ONE case with its native attachments.
+ *
+ * `attachments` is only present on GET /api/cases/:id (loadCaseDetail in
+ * server/dist/routes/cases.js). The list endpoint returns bare case rows, so
+ * the calendar grid deliberately does not have this data: calling it per card
+ * would add one API round trip per post on every month render. The panel asks
+ * for it when a card is selected, and only then.
+ */
+export async function fetchCaseDetail(
+  ctx: PluginContext,
+  cfg: CalendarConfig,
+  caseIdOrIdentifier: string,
+  companyId: string,
+): Promise<CaseDetail> {
+  const body = await apiGet<PaperclipCaseDetail | { case: PaperclipCaseDetail }>(
+    ctx,
+    cfg,
+    `/api/cases/${encodeURIComponent(caseIdOrIdentifier)}`,
+    companyId,
+  );
+  return toDetail("case" in body ? body.case : body);
 }
 
 /**

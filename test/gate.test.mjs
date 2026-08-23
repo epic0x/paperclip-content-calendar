@@ -219,3 +219,37 @@ test("scheduled publishing does not depend on companies.list invocation scope", 
   assert.doesNotMatch(worker, /ctx\.companies\.list\(\)/);
   assert.match(worker, /UNTRACE_COMPANY_ID/);
 });
+
+// --- 0.3.0 regressions -----------------------------------------------------
+//
+// The editor panel added caption editing, native-asset attachments and a
+// status dropdown. None of that is allowed to move the publish gate.
+
+test("a native asset attachment does not change a single gate outcome", () => {
+  const asset = "asset:8f14e45f-ceea-467a-9c1e-3a0a1b2c3d4e";
+
+  assert.equal(evaluate(input({ mediaFile: asset })).outcome, "publish");
+  assert.equal(
+    evaluate(input({ mediaFile: asset, status: "in_review", approved: false })).outcome,
+    "skipped",
+  );
+  assert.equal(
+    evaluate(input({ mediaFile: asset, caption: null })).reason,
+    "case has no caption",
+  );
+  assert.equal(
+    evaluate(input({ mediaFile: asset }, { alreadySent: true })).reason,
+    "already published",
+  );
+  assert.equal(
+    evaluate(input({ mediaFile: asset }, { paused: true, manual: true })).outcome,
+    "dry_run",
+  );
+});
+
+test("an empty caption saved from the panel still blocks publishing, by either route", () => {
+  // buildContentPatch turns "" into null, which is what toEntry already reads
+  // back as "no caption" — the gate must keep treating that as a blocker.
+  assert.equal(evaluate(input({ caption: null })).outcome, "skipped");
+  assert.equal(evaluate(input({ caption: null }, { manual: true })).outcome, "skipped");
+});

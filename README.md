@@ -1,7 +1,9 @@
 # Content Calendar — a Paperclip plugin
 
 A month calendar for `social_post` cases, plus a job that publishes them when
-they are approved and due.
+they are approved and due. Selecting a post opens an editor panel that can do
+the whole job — text, alt text, status, image, schedule, publish — so the Cases
+page is never a required stop.
 
 **Cases stay the source of truth.** This plugin does not author content, does
 not copy captions into its own table, and does not invent its own approval
@@ -25,6 +27,7 @@ names. Before writing anything we audited the live instance
 | **Publish date** | **nothing** | read `fields.publish_at` |
 | **Calendar view** | **nothing** | this plugin |
 | **Publisher** | **nothing** | this plugin |
+| Image storage | `assets` + `case_attachments`, and `POST /cases/:id/attachments` | upload through the native endpoint, store nothing ourselves |
 
 The three "nothing" rows are the entire scope.
 
@@ -37,6 +40,90 @@ status. `fields.approved` is ignored.
 
 Reviewers move a case to **Approved** in the Paperclip UI. That is the whole
 handoff.
+
+---
+
+## The editor panel
+
+Clicking a post opens a panel on the right. It holds:
+
+- **Caption and alt text** — a textarea and an input with one explicit **Save**.
+  Unsaved edits are marked, and the result of the save is stated inline. Nothing
+  auto-saves.
+- **Status** — a dropdown of the four review states (Draft, In review, Approved,
+  Cancelled). This writes the **native** `cases.status`, the same field the
+  Paperclip case page writes, emitting the same `status_changed` event. `done`
+  and `in_progress` are not offered: a post becomes done by being published.
+  `PANEL_STATUSES` in `src/cases.ts` is the single list, shared by the dropdown
+  and the worker's validation, so the UI cannot offer a transition the worker
+  would refuse.
+- **Image** — a bounded preview of the attached image, read straight from the
+  native asset content endpoint, with the case's alt text on the `<img>`. Empty,
+  legacy and failed-to-load states each say what is actually true rather than
+  showing a broken frame.
+- **Replace image** — a file picker that uploads to Paperclip and repoints the
+  case at the new asset.
+- **Schedule and Post Now** — unchanged from 0.2.x.
+
+### How an image replacement actually works
+
+Traced from the installed server rather than guessed:
+
+1. The browser posts the file to **`POST /api/cases/:id/attachments`**
+   (`server/dist/routes/cases.js`) as `multipart/form-data` with the field name
+   `file`. That one call creates the `assets` row, links it to the case through
+   `case_attachments`, and records an `attachment_added` case event.
+2. Only after that succeeds does the plugin worker write
+   `fields.media_file = "asset:<uuid>"` (plus alt text) with a **merged** patch.
+
+The ordering is the safety property: **the previous image stays attached and
+stays referenced until the new one is in place.** A failed upload changes
+nothing.
+
+Two details worth keeping:
+
+- **The upload is a browser `fetch` with `credentials: "include"`, and that is
+  deliberate.** Plugin UI is served from `/_plugins/:pluginId/ui/*` and imported
+  as an ES module into the host document, so it is same-origin and carries the
+  operator's session — which is exactly how Paperclip's own UI uploads files
+  (`postForm` → `fetch("/api"+path, {credentials:"include"})`, with no
+  `Content-Type` header so the browser can set the multipart boundary). Sending
+  bytes through the plugin bridge instead is not an option: that path is JSON
+  with a 10 MB body limit, and base64 of a 10 MB image is ~13.3 MB.
+- **The worker re-checks the link before repointing `media_file`.** It reads the
+  case back and refuses an asset that is not actually attached to it, so a
+  crafted action call cannot point a case at an arbitrary asset id.
+
+### Validation
+
+`POST /cases/:id/attachments` enforces the company's byte cap and rejects an
+empty body, but — unlike `/companies/:id/assets/images` — it does **not** check
+the content type. So the plugin checks it: PNG, JPEG, WebP and GIF only, the
+image subset of Paperclip's own `DEFAULT_ALLOWED_TYPES`. SVG is excluded
+because only the assets/images route sanitises SVG, and no channel we publish to
+accepts it. The size limit shown in the panel is the real
+`companies.attachment_max_bytes`, read through the plugin's `coreReadTables`
+access rather than hardcoded.
+
+### Publishing a native attachment
+
+The X adapter publishes from a **file path** — it owns the OAuth1 v1.1 multipart
+media upload and is the one part of this system proven end to end. So when
+`media_file` is an `asset:<uuid>` reference, `src/media.ts` downloads the bytes
+from the native content endpoint into a temp file for the length of one publish
+and deletes it afterwards. A legacy host path is handed through untouched, so
+every case that already publishes keeps publishing the same way. A download
+failure is recorded as a **failed** attempt — never a text-only post of a case
+that was meant to carry an image.
+
+### One request per selection
+
+`attachments` only exists on `GET /api/cases/:id`; the case **list** endpoint
+returns bare rows. Projecting attachments onto every chip would therefore cost
+one API round trip per post on every render of the month. Instead the
+`case-detail` data handler is called by the panel, which is mounted only while a
+card is selected — so the grid stays one request and detail is read once per
+selection.
 
 ---
 
@@ -87,6 +174,22 @@ including Post Now, because a stop a button can walk past is not a stop.
 
 ---
 
+## Worker surface
+
+| Kind | Key | What it does |
+| --- | --- | --- |
+| data | `calendar` | Every `social_post` case, grouped by Dubai day. One API read. |
+| data | `case-detail` | One case with its native attachments and the upload limits. Called only while a card is selected. |
+| data | `attempts` | Recent publish attempts, newest first. |
+| data | `status` | Config health, so the UI can explain itself instead of rendering empty. |
+| action | `save-content` | Writes caption / alt text as a merged field patch. |
+| action | `set-status` | Writes the native case status. Only `PANEL_STATUSES`. |
+| action | `set-media` | Repoints `media_file` at an asset already attached to the case. Refuses anything else. |
+| action | `reschedule` | Moves `publish_at`, server-enforced to a Dubai `:00`/`:30` slot. |
+| action | `post-now` | Publishes one case through the same gate as the cron sweep, with `manual: true`. |
+
+---
+
 ## Configuration
 
 Set on the plugin's settings page after install:
@@ -103,16 +206,22 @@ Set on the plugin's settings page after install:
 
 ## Channel adapters
 
-`src/channels.ts` defines the `ChannelAdapter` contract. The X and LinkedIn
-adapters are **deliberately unimplemented** — they report `isConfigured: false`,
-so the job records `skipped / no configured adapter` and never pretends to have
-posted.
+`src/channels.ts` defines the `ChannelAdapter` contract.
 
-Implementing them is the CMO's lane, because publishing and the channel
-credentials are. To add one: implement `publish`, make `isConfigured` check for
-the resolved token, and register it in `ADAPTERS`. Put the token in plugin
-config as a secret reference — never in the source, and never as a spawned
-script path.
+**X** delegates to the host publish script, which owns the OAuth1 credentials
+and the v1.1 multipart media upload; the token never enters this process, the
+plugin config, or the database. It reports `isConfigured: false` when that
+script is absent, so the job records `skipped / no configured adapter` rather
+than pretending to have posted.
+
+**LinkedIn** stays unimplemented on purpose: the only token we hold is
+`w_member_social`, which posts to a personal profile rather than the company
+page. It reports `isConfigured: false` until the Community Management API
+application is approved.
+
+To add an adapter: implement `publish`, make `isConfigured` check for the
+resolved credential, and register it in `ADAPTERS`. Put the credential in plugin
+config as a secret reference — never in the source.
 
 ---
 
@@ -165,5 +274,10 @@ disagrees with the compiled constant.
   remains a UTC instant in storage. Both the worker's day grouping and the UI's
   Today marker, labels, input value, and save conversion use the same Dubai
   helper module, so posts around midnight stay on the correct local date.
-- **Plugin UI is same-origin, not sandboxed.** Fine for a plugin we wrote;
-  a reason not to install third-party plugins casually.
+- **Plugin UI is same-origin, not sandboxed.** That is what makes the native
+  upload work at all — and a reason not to install third-party plugins casually.
+- **`POST /cases/:id/attachments` does not validate content type.** Only
+  `/companies/:id/assets/images` does. Anything relying on the server to reject
+  a non-image is relying on a check that is not there.
+- **`media_file` may be an `asset:<uuid>` reference or a legacy host path.**
+  Both publish. `parseAssetRef()` is the only place that tells them apart.

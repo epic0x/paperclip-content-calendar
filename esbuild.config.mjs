@@ -39,16 +39,50 @@ const gateOptions = {
   logLevel: "info",
 };
 
-const timeOptions = {
-  entryPoints: ["src/time.ts"],
-  outfile: "dist/time.js",
+/**
+ * The same reasoning applies to every other module the unit tests import
+ * directly: `node --test` loads built ESM from dist/, so a module that only
+ * ever exists inside worker.js or ui/index.js cannot be tested at all.
+ *
+ * These are all small and dependency-free by design — the pure attachment
+ * rules, the case projection/write-back client, the publish-time media
+ * resolver, and the browser upload helper.
+ */
+const nodeModule = (name) => ({
+  entryPoints: [`src/${name}.ts`],
+  outfile: `dist/${name}.js`,
   bundle: true,
   format: "esm",
   platform: "node",
   target: ["node22"],
   sourcemap: true,
   logLevel: "info",
-};
+});
+
+const timeOptions = nodeModule("time");
+const attachmentsOptions = nodeModule("attachments");
+const casesOptions = nodeModule("cases");
+const mediaOptions = nodeModule("media");
+
+/**
+ * The browser-side modules that are worth testing on their own, emitted beside
+ * the UI bundle: the upload helper (FormData, the page's fetch, the session
+ * cookie) and the panel's pure rules (which card the open panel is showing,
+ * and which section an action's outcome belongs in).
+ */
+const browserModule = (name) => ({
+  entryPoints: [`src/ui/${name}.ts`],
+  outfile: `dist/ui/${name}.js`,
+  bundle: true,
+  format: "esm",
+  platform: "browser",
+  target: ["es2022"],
+  sourcemap: true,
+  logLevel: "info",
+});
+
+const uploadOptions = browserModule("upload");
+const panelOptions = browserModule("panel");
 
 const contexts = await Promise.all([
   esbuild.context(workerOptions),
@@ -56,11 +90,18 @@ const contexts = await Promise.all([
   esbuild.context(presets.esbuild.ui),
   esbuild.context(gateOptions),
   esbuild.context(timeOptions),
+  esbuild.context(attachmentsOptions),
+  esbuild.context(casesOptions),
+  esbuild.context(mediaOptions),
+  esbuild.context(uploadOptions),
+  esbuild.context(panelOptions),
 ]);
 
 if (watch) {
   await Promise.all(contexts.map((c) => c.watch()));
-  console.log("esbuild watch mode enabled for worker, manifest, ui, gate, time");
+  console.log(
+    "esbuild watch mode enabled for worker, manifest, ui, gate, time, attachments, cases, media, upload, panel",
+  );
 } else {
   await Promise.all(contexts.map((c) => c.rebuild()));
   await Promise.all(contexts.map((c) => c.dispose()));

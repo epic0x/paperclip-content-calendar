@@ -1,4 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { dubaiDayKey, isHalfHourSlot } from "./time.js";
 import {
   definePlugin,
@@ -14,6 +17,14 @@ import {
 } from "./manifest.js";
 import {
   CasesNotConfiguredError,
+  PANEL_STATUSES,
+  assertAttachedAsset,
+  buildContentPatch,
+  buildMediaPatch,
+  describeSetMediaFailure,
+  downloadAsset,
+  fetchCaseDetail,
+  isPanelStatus,
   listSocialCases,
   patchCaseFields,
   readConfig,
@@ -21,6 +32,11 @@ import {
   type CalendarEntry,
   type CaseStatus,
 } from "./cases.js";
+import {
+  ALLOWED_IMAGE_TYPES,
+  DEFAULT_MAX_UPLOAD_BYTES,
+} from "./attachments.js";
+import { resolveMediaForPublish, type ResolvedMedia } from "./media.js";
 import { adapterFor } from "./channels.js";
 import { evaluate } from "./gate.js";
 
@@ -40,6 +56,63 @@ function requireStr(v: unknown, name: string): string {
   return v.trim();
 }
 
+
+/**
+ * The company's attachment byte cap.
+ *
+ * `POST /api/cases/:id/attachments` enforces `companies.attachment_max_bytes`
+ * and falls back to 10 MiB (server/dist/routes/cases.js). `companies` is in the
+ * host's PLUGIN_DATABASE_CORE_READ_TABLES whitelist and this plugin declares it
+ * in `coreReadTables`, so the same number can be read here instead of guessed —
+ * which is what lets the panel reject an oversized file before uploading it.
+ *
+ * A failure here is not worth breaking the panel over: fall back to the server
+ * default and say so in the log.
+ */
+async function uploadLimitBytes(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<number> {
+  try {
+    const rows = await ctx.db.query<{ attachment_max_bytes: number | null }>(
+      `SELECT attachment_max_bytes FROM public.companies WHERE id = $1`,
+      [companyId],
+    );
+    const value = rows[0]?.attachment_max_bytes;
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+      ? value
+      : DEFAULT_MAX_UPLOAD_BYTES;
+  } catch (err) {
+    ctx.logger.warn(
+      `[content-calendar] could not read companies.attachment_max_bytes (${
+        err instanceof Error ? err.message : String(err)
+      }); using the ${DEFAULT_MAX_UPLOAD_BYTES}-byte default`,
+    );
+    return DEFAULT_MAX_UPLOAD_BYTES;
+  }
+}
+
+/**
+ * Real IO for `resolveMediaForPublish`.
+ *
+ * The temp file lives in the OS temp dir for the duration of one publish and is
+ * removed in a finally, including when the adapter throws. Its name carries a
+ * fresh uuid per attempt, so a scheduled sweep and a Post Now on the same case
+ * cannot delete each other's copy mid-upload.
+ */
+function mediaDeps(ctx: PluginContext, cfg: CalendarConfig, companyId: string) {
+  return {
+    downloadAsset: (assetId: string) =>
+      downloadAsset(ctx, cfg, assetId, companyId),
+    writeTempFile: async (fileName: string, bytes: Uint8Array) => {
+      const path = join(tmpdir(), fileName);
+      await writeFile(path, bytes);
+      return path;
+    },
+    removeFile: (path: string) => rm(path, { force: true }),
+    newAttemptId: () => randomUUID(),
+  };
+}
 
 async function sentCaseIds(
   ctx: PluginContext,
@@ -200,6 +273,43 @@ async function registerDataHandlers(ctx: PluginContext): Promise<void> {
       channels,
     };
   });
+
+  /**
+   * case-detail — ONE case, with its native attachments and the upload limits.
+   *
+   * Deliberately not folded into `calendar`: attachments only exist on
+   * GET /api/cases/:id, so including them in the month view would cost one API
+   * round trip per card on every render. The panel asks for this when a card is
+   * selected and not before.
+   *
+   * Params: companyId, caseId (id or identifier).
+   */
+  ctx.data.register("case-detail", async (params) => {
+    const companyId = requireStr(params.companyId, "companyId");
+    const caseId = requireStr(params.caseId, "caseId");
+    const cfg = await readConfig(ctx, companyId);
+
+    const limits = {
+      maxUploadBytes: await uploadLimitBytes(ctx, companyId),
+      allowedImageTypes: [...ALLOWED_IMAGE_TYPES],
+    };
+
+    try {
+      const detail = await fetchCaseDetail(ctx, cfg, caseId, companyId);
+      return { configured: true, error: null, detail, ...limits };
+    } catch (err) {
+      if (err instanceof CasesNotConfiguredError) {
+        return { configured: false, error: err.message, detail: null, ...limits };
+      }
+      // A detail read that fails must say so in the panel rather than render an
+      // empty editor over a case that is actually fine.
+      const message = err instanceof Error ? err.message : String(err);
+      ctx.logger.warn(
+        `[content-calendar] case-detail ${caseId} failed: ${message}`,
+      );
+      return { configured: true, error: message, detail: null, ...limits };
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -267,18 +377,22 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
    * approval mechanism, so approving here and approving there are identical and
    * both emit a `status_changed` case event.
    *
-   * Only the review transitions are allowed. Publishing, cancelling and
-   * completing are deliberately not exposed on a calendar chip.
+   * The allowed set is PANEL_STATUSES, and Cancelled is part of it on purpose:
+   * killing a post that should not go out is a calendar decision, and it is the
+   * one status change an operator needs to make in a hurry. `done` and
+   * `in_progress` are the ones deliberately absent — a case becomes done by
+   * being published, not by a dropdown.
    */
   ctx.actions.register("set-status", async (params, actionContext) => {
     const companyId = requireStr(params.companyId, "companyId");
     const identifier = requireStr(params.caseIdentifier, "caseIdentifier");
     const status = requireStr(params.status, "status");
 
-    const ALLOWED = new Set(["draft", "in_review", "approved", "cancelled"]);
-    if (!ALLOWED.has(status)) {
+    // One list, shared with the dropdown, so the UI cannot offer a transition
+    // this handler would refuse.
+    if (!isPanelStatus(status)) {
       throw new Error(
-        `status "${status}" is not settable from the calendar; allowed: ${[...ALLOWED].join(", ")}`,
+        `status "${status}" is not settable from the calendar; allowed: ${PANEL_STATUSES.join(", ")}`,
       );
     }
 
@@ -308,6 +422,131 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
     });
 
     return { ok: true, identifier, status: updated.status };
+  });
+
+  /**
+   * save-content — write the caption and alt text the operator edited.
+   *
+   * Only the keys actually edited are sent. `patchCaseFields` still reads the
+   * case first and re-sends the whole `fields` object, because Paperclip
+   * REPLACES `fields` wholesale on PATCH — a bare `{caption}` would destroy
+   * channel, publish_at and media_file.
+   */
+  ctx.actions.register("save-content", async (params, actionContext) => {
+    const companyId = requireStr(params.companyId, "companyId");
+    const identifier = requireStr(params.caseIdentifier, "caseIdentifier");
+
+    const patch = buildContentPatch({
+      caption: typeof params.caption === "string" ? params.caption : undefined,
+      altText: typeof params.altText === "string" ? params.altText : undefined,
+    });
+    if (Object.keys(patch).length === 0) {
+      throw new Error("save-content was called with nothing to save");
+    }
+
+    const cfg = await readConfig(ctx, companyId);
+    const updated = await patchCaseFields(
+      ctx,
+      cfg,
+      identifier,
+      patch,
+      undefined,
+      companyId,
+    );
+
+    await ctx.activity.log({
+      companyId,
+      message: `Case ${identifier} text edited from the content calendar`,
+      entityType: "case",
+      entityId: updated.id,
+      metadata: {
+        fields: Object.keys(patch),
+        actor: actionContext?.actor?.userId ?? "calendar-ui",
+      },
+    });
+
+    return {
+      ok: true,
+      identifier,
+      caption: (updated.fields?.caption as string | null) ?? null,
+      altText: (updated.fields?.alt_text as string | null) ?? null,
+    };
+  });
+
+  /**
+   * set-media — point the case at an image that is already attached to it.
+   *
+   * The browser uploads the bytes to the native endpoint
+   * (POST /api/cases/:id/attachments) because plugin UI is same-origin and
+   * carries the session cookie, exactly like Paperclip's own upload path. This
+   * action runs afterwards, holding the board API key, and does two things the
+   * browser must not be trusted to do:
+   *
+   *   1. re-reads the case and REFUSES an asset that is not actually attached
+   *      to it, so `media_file` cannot be pointed anywhere by a crafted call;
+   *   2. writes `media_file` (and alt text) as a merged patch.
+   *
+   * Ordering is the safety property: the previous image stays attached and
+   * stays referenced until the upload AND the link both succeeded.
+   */
+  ctx.actions.register("set-media", async (params, actionContext) => {
+    const companyId = requireStr(params.companyId, "companyId");
+    const identifier = requireStr(params.caseIdentifier, "caseIdentifier");
+    const assetId = requireStr(params.assetId, "assetId");
+
+    const cfg = await readConfig(ctx, companyId);
+
+    // Every failure below — the detail read, the "not attached to this case"
+    // refusal, the patch itself — is logged HERE with the case and asset before
+    // it goes back to the browser. The panel shows the operator one line and is
+    // then closed; without this, a repointing that failed leaves nothing on the
+    // server saying what was being pointed where. The error is rethrown
+    // unchanged, so the action's behaviour is exactly as it was.
+    const { detail, attachment, updated } = await (async () => {
+      const found = await fetchCaseDetail(ctx, cfg, identifier, companyId);
+      const linked = assertAttachedAsset(found, assetId);
+      const patched = await patchCaseFields(
+        ctx,
+        cfg,
+        identifier,
+        buildMediaPatch({
+          assetId,
+          altText:
+            typeof params.altText === "string" ? params.altText : undefined,
+        }),
+        undefined,
+        companyId,
+      );
+      return { detail: found, attachment: linked, updated: patched };
+    })().catch((err: unknown) => {
+      ctx.logger.error(
+        describeSetMediaFailure({ identifier, assetId, companyId, err }),
+      );
+      throw err;
+    });
+
+    await ctx.activity.log({
+      companyId,
+      message: `Case ${identifier} image replaced from the content calendar (asset ${assetId})`,
+      entityType: "case",
+      entityId: updated.id,
+      metadata: {
+        assetId,
+        attachmentId: attachment.id,
+        contentType: attachment.contentType,
+        byteSize: attachment.byteSize,
+        previousMediaFile: detail.mediaFile,
+        actor: actionContext?.actor?.userId ?? "calendar-ui",
+      },
+    });
+
+    return {
+      ok: true,
+      identifier,
+      assetId,
+      contentPath: attachment.contentPath,
+      mediaFile: (updated.fields?.media_file as string | null) ?? null,
+    };
   });
 
   /**
@@ -394,11 +633,47 @@ async function attemptOne(
   }
 
   // decision.outcome === "publish"
-  const result = await (adapter as NonNullable<typeof adapter>).publish(ctx, cfg, {
-    entry,
-    caption: entry.caption as string,
-    mediaFile: entry.mediaFile,
-  });
+  //
+  // The adapter publishes from a FILE PATH. When media_file is a native asset
+  // reference the bytes are fetched from Paperclip and written to a temp file
+  // for the length of this post; a legacy host path is handed through
+  // unchanged, so everything that already publishes keeps publishing the same
+  // way. A download failure is recorded as a failed attempt — never a
+  // text-only post of a case that was meant to carry an image.
+  let media: ResolvedMedia;
+  try {
+    media = await resolveMediaForPublish(entry.mediaFile, mediaDeps(ctx, cfg, companyId));
+  } catch (err) {
+    const reason = `could not read the attached image: ${
+      err instanceof Error ? err.message : String(err)
+    }`;
+    await recordAttempt(ctx, {
+      companyId,
+      entry,
+      outcome: "failed",
+      reason,
+      postUrl: null,
+      raw: { mediaFile: entry.mediaFile },
+    });
+    return { outcome: "failed", reason, url: null };
+  }
+
+  let result;
+  try {
+    result = await (adapter as NonNullable<typeof adapter>).publish(ctx, cfg, {
+      entry,
+      caption: entry.caption as string,
+      mediaFile: media.path,
+    });
+  } finally {
+    await media.cleanup().catch((err: unknown) => {
+      ctx.logger.warn(
+        `[content-calendar] could not remove the temp copy of ${entry.mediaFile}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+  }
 
   if (!result.ok || !result.url) {
     const reason = result.error ?? "adapter returned no url";
