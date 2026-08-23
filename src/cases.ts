@@ -232,36 +232,33 @@ export function toEntry(c: PaperclipCase): CalendarEntry {
 /**
  * Fetch every social_post case for a company.
  *
- * The API caps `limit` at 200; we page until a short page comes back so the
- * calendar does not silently truncate once the backlog grows.
+ * PITFALL: the case list endpoint validates its query with a STRICT schema and
+ * rejects unknown keys outright — sending `offset` returns
+ *   400 {"error":"Invalid case list query","details":[{"code":
+ *        "unrecognized_keys","keys":["offset"]}]}
+ * There is no offset-based pagination. `limit` is capped at 200 by the API, so
+ * we ask for the maximum and warn if we hit it rather than silently showing a
+ * truncated calendar.
  */
 export async function listSocialCases(
   ctx: PluginContext,
   cfg: CalendarConfig,
   companyId: string,
 ): Promise<CalendarEntry[]> {
-  const out: CalendarEntry[] = [];
   const limit = 200;
-  let offset = 0;
-
-  for (let page = 0; page < 25; page += 1) {
-    const qs = new URLSearchParams({
-      type: CASE_TYPE,
-      limit: String(limit),
-      offset: String(offset),
-    });
-    const body = await apiGet<{ cases?: PaperclipCase[] } | PaperclipCase[]>(
-      ctx,
-      cfg,
-      `/api/companies/${companyId}/cases?${qs.toString()}`,
+  const qs = new URLSearchParams({ type: CASE_TYPE, limit: String(limit) });
+  const body = await apiGet<{ cases?: PaperclipCase[] } | PaperclipCase[]>(
+    ctx,
+    cfg,
+    `/api/companies/${companyId}/cases?${qs.toString()}`,
+  );
+  const batch = Array.isArray(body) ? body : (body.cases ?? []);
+  if (batch.length >= limit) {
+    ctx.logger.warn(
+      `[content-calendar] case list hit the API limit of ${limit}; the calendar may be incomplete. The endpoint has no offset parameter, so this needs date-range filtering to go further.`,
     );
-    const batch = Array.isArray(body) ? body : (body.cases ?? []);
-    out.push(...batch.map(toEntry));
-    if (batch.length < limit) break;
-    offset += limit;
   }
-
-  return out;
+  return batch.map(toEntry);
 }
 
 /**
