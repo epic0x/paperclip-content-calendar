@@ -1,408 +1,260 @@
-import { useCallback, useState } from "react";
-import { usePluginAction, usePluginData } from "@paperclipai/plugin-sdk/ui";
-import { PostEditor } from "./PostEditor.js";
+/**
+ * Calendar view over social_post cases.
+ *
+ * Deliberately read-mostly. Content, media and approval all live on the case,
+ * so editing belongs on the case detail page where the versioned document and
+ * the native lifecycle already are. Rebuilding an editor here would be a second
+ * way to change the same thing.
+ *
+ * Status colours come from the NATIVE case lifecycle. The calendar has no
+ * status vocabulary of its own.
+ */
+import { useMemo, useState } from "react";
+import { usePluginData, usePluginAction } from "@paperclipai/plugin-sdk/ui";
 
-type Post = {
-  id: string;
-  content: string;
-  scheduled_date: string;
-  scheduled_time: string | null;
-  status: string;
-  platform: string;
-  post_url: string | null;
-  error_message: string | null;
+type PublishInfo = {
+  outcome: string;
+  url: string | null;
+  at: string;
+  error: string | null;
 };
 
-type CalendarDay = {
-  date: string;
-  posts: Post[];
+type PostEntry = {
+  ref: string;
+  title: string;
+  caption: string | null;
+  channel: string;
+  status: string;
+  angle: string | null;
+  publishAt: string | null;
+  hasMedia: boolean;
+  charCount: number;
+  published: PublishInfo | null;
 };
 
 type CalendarData = {
-  calendar: CalendarDay[];
-  totalPosts: number;
+  byDate: Record<string, PostEntry[]>;
+  stats: { total: number; scheduled: number; approved: number; posted: number };
+  generatedAt: string;
 };
 
-type PostStats = {
-  total: number;
-  draft: number;
-  approved: number;
-  posted: number;
-  failed: number;
-  cancelled: number;
+/** Native Paperclip lifecycle → colour. One source of truth for status. */
+const STATUS_COLOUR: Record<string, string> = {
+  draft: "#6b7280",
+  in_progress: "#d97706",
+  in_review: "#2563eb",
+  approved: "#15803d",
+  done: "#4b5563",
+  cancelled: "#9ca3af",
 };
 
-const tokens = {
-  border: "var(--border, oklch(0.269 0 0))",
-  card: "var(--card, oklch(0.205 0 0))",
-  bg: "var(--background, oklch(0.145 0 0))",
-  fg: "var(--foreground, oklch(0.985 0 0))",
-  muted: "var(--muted-foreground, oklch(0.708 0 0))",
-  primary: "var(--primary, oklch(0.985 0 0))",
-  primaryFg: "var(--primary-foreground, oklch(0.205 0 0))",
-  accent: "var(--accent, oklch(0.269 0 0))",
-  calendarPurple: "oklch(0.35 0.08 280)",
-  calendarPurpleFg: "oklch(0.85 0.12 280)",
-};
+const DAY_MS = 86_400_000;
 
-const statusConfig: Record<string, { bg: string; fg: string; label: string }> = {
-  draft: { bg: "oklch(0.27 0.06 250)", fg: "oklch(0.85 0.1 250)", label: "Draft" },
-  approved: { bg: "oklch(0.27 0.06 145)", fg: "oklch(0.85 0.1 145)", label: "Approved" },
-  posted: { bg: "oklch(0.22 0.06 145)", fg: "oklch(0.72 0.15 145)", label: "Posted" },
-  failed: { bg: "oklch(0.27 0.08 25)", fg: "oklch(0.82 0.13 25)", label: "Failed" },
-  cancelled: { bg: "oklch(0.2 0 0)", fg: "oklch(0.55 0 0)", label: "Cancelled" },
-};
-
-function StatusBadge({ status }: { status: string }) {
-  const cfg = statusConfig[status] ?? statusConfig.draft!;
-  return (
-    <span
-      style={{
-        padding: "2px 8px",
-        borderRadius: 20,
-        fontSize: 11,
-        fontWeight: 600,
-        background: cfg.bg,
-        color: cfg.fg,
-        textTransform: "capitalize",
-        whiteSpace: "nowrap",
-      }}
-    >
-      {cfg.label}
-    </span>
-  );
+function isoDate(d: Date): string {
+  return d.toISOString().slice(0, 10);
 }
 
-function PostCard({ post, onEdit, onApprove, onUnapprove }: {
-  post: Post;
-  onEdit: (post: Post) => void;
-  onApprove: (postId: string) => Promise<void>;
-  onUnapprove: (postId: string) => Promise<void>;
-}) {
-  const [busy, setBusy] = useState(false);
-
-  const handleApprove = useCallback(async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setBusy(true);
-    try {
-      await onApprove(post.id);
-    } finally {
-      setBusy(false);
-    }
-  }, [post.id, onApprove]);
-
-  const handleUnapprove = useCallback(async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setBusy(true);
-    try {
-      await onUnapprove(post.id);
-    } finally {
-      setBusy(false);
-    }
-  }, [post.id, onUnapprove]);
-
-  return (
-    <div
-      onClick={() => onEdit(post)}
-      style={{
-        background: tokens.bg,
-        border: `1px solid ${tokens.border}`,
-        borderRadius: 8,
-        padding: "10px 12px",
-        cursor: "pointer",
-        transition: "border-color 0.15s",
-        marginBottom: 8,
-      }}
-      onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.borderColor = "oklch(0.5 0.1 280)"; }}
-      onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.borderColor = tokens.border; }}
-    >
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, marginBottom: 6 }}>
-        <StatusBadge status={post.status} />
-        {post.scheduled_time && (
-          <span style={{ fontSize: 11, color: tokens.muted }}>{post.scheduled_time.slice(0, 5)}</span>
-        )}
-      </div>
-
-      <p style={{
-        margin: "0 0 8px 0",
-        fontSize: 13,
-        lineHeight: 1.5,
-        color: tokens.fg,
-        display: "-webkit-box",
-        WebkitLineClamp: 3,
-        WebkitBoxOrient: "vertical",
-        overflow: "hidden",
-      }}>
-        {post.content}
-      </p>
-
-      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-        {post.status === "draft" && (
-          <button
-            onClick={handleApprove}
-            disabled={busy}
-            style={{
-              padding: "3px 10px",
-              fontSize: 12,
-              background: "oklch(0.27 0.06 145)",
-              border: `1px solid oklch(0.45 0.12 145)`,
-              borderRadius: 6,
-              color: "oklch(0.9 0.12 145)",
-              cursor: busy ? "not-allowed" : "pointer",
-              fontWeight: 600,
-            }}
-          >
-            Approve
-          </button>
-        )}
-        {post.status === "approved" && (
-          <button
-            onClick={handleUnapprove}
-            disabled={busy}
-            style={{
-              padding: "3px 10px",
-              fontSize: 12,
-              background: "oklch(0.27 0.06 250)",
-              border: `1px solid oklch(0.45 0.12 250)`,
-              borderRadius: 6,
-              color: "oklch(0.85 0.1 250)",
-              cursor: busy ? "not-allowed" : "pointer",
-            }}
-          >
-            Unapprove
-          </button>
-        )}
-        <button
-          onClick={(e) => { e.stopPropagation(); onEdit(post); }}
-          style={{
-            padding: "3px 10px",
-            fontSize: 12,
-            background: "transparent",
-            border: `1px solid ${tokens.border}`,
-            borderRadius: 6,
-            color: tokens.muted,
-            cursor: "pointer",
-          }}
-        >
-          Edit
-        </button>
-      </div>
-    </div>
-  );
+/** Fourteen days from today — the working window, not an infinite scroll. */
+function windowDays(days = 14): string[] {
+  const start = new Date();
+  start.setUTCHours(0, 0, 0, 0);
+  return Array.from({ length: days }, (_, i) => isoDate(new Date(start.getTime() + i * DAY_MS)));
 }
 
-function DayColumn({ day, onEdit, onApprove, onUnapprove }: {
-  day: CalendarDay;
-  onEdit: (post: Post) => void;
-  onApprove: (postId: string) => Promise<void>;
-  onUnapprove: (postId: string) => Promise<void>;
-}) {
-  const date = new Date(day.date + "T00:00:00");
-  const isToday = day.date === new Date().toISOString().slice(0, 10);
-  const dayName = date.toLocaleDateString("en-US", { weekday: "short" });
-  const dayNum = date.getDate();
-  const monthName = date.toLocaleDateString("en-US", { month: "short" });
+function weekday(iso: string): string {
+  return new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-GB", {
+    weekday: "short", timeZone: "UTC",
+  });
+}
 
-  return (
-    <div
-      style={{
-        minWidth: 180,
-        maxWidth: 220,
-        flex: "1 1 180px",
-        background: isToday ? "oklch(0.18 0.04 280)" : tokens.card,
-        border: `1px solid ${isToday ? "oklch(0.4 0.1 280)" : tokens.border}`,
-        borderRadius: 10,
-        padding: "12px 10px",
-        display: "flex",
-        flexDirection: "column",
-        gap: 0,
-      }}
-    >
-      <div style={{ marginBottom: 12, textAlign: "center" }}>
-        <div style={{ fontSize: 12, color: tokens.muted, textTransform: "uppercase", letterSpacing: 1 }}>{dayName}</div>
-        <div style={{ fontSize: 22, fontWeight: 700, color: isToday ? "oklch(0.85 0.15 280)" : tokens.fg, lineHeight: 1.2 }}>{dayNum}</div>
-        <div style={{ fontSize: 11, color: tokens.muted }}>{monthName}</div>
-        {isToday && (
-          <div style={{ fontSize: 10, color: "oklch(0.7 0.12 280)", marginTop: 2, fontWeight: 600 }}>TODAY</div>
-        )}
-      </div>
+function dayNum(iso: string): string {
+  return new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-GB", {
+    day: "numeric", month: "short", timeZone: "UTC",
+  });
+}
 
-      <div style={{ flex: 1, minHeight: 60 }}>
-        {day.posts.length === 0 ? (
-          <div style={{ textAlign: "center", color: tokens.muted, fontSize: 12, padding: "16px 0", opacity: 0.6 }}>
-            No posts
-          </div>
-        ) : (
-          day.posts.map((post) => (
-            <PostCard
-              key={post.id}
-              post={post}
-              onEdit={onEdit}
-              onApprove={onApprove}
-              onUnapprove={onUnapprove}
-            />
-          ))
-        )}
-      </div>
-    </div>
-  );
+function timeOf(publishAt: string | null): string {
+  if (!publishAt) return "";
+  const t = publishAt.split("T")[1];
+  return t ? `${t.slice(0, 5)} UTC` : "";
 }
 
 export function CalendarView({ companyId }: { companyId: string }) {
-  const [editingPost, setEditingPost] = useState<Post | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [generating, setGenerating] = useState(false);
-  const [generateError, setGenerateError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  // `usePluginData(key, params)` takes no deps array — the third argument was
-  // silently ignored by TypeScript's overload resolution and the refresh never
-  // fired, so approving a post left the grid stale until a full page reload.
-  // Folding refreshKey into params makes it part of the query identity, which
-  // is what actually re-runs the fetch.
-  const calendarData = usePluginData<CalendarData>("calendar", { companyId, days: 10, refreshKey });
-  const statsData = usePluginData<PostStats>("stats", { companyId, refreshKey });
-  const generateBatch = usePluginAction("generate-batch");
-  const approvePost = usePluginAction("approve-post");
-  const unapprovePost = usePluginAction("unapprove-post");
+  // refreshKey belongs in params, not a deps array: usePluginData takes
+  // (key, params), and params are what identify the query.
+  const data = usePluginData<CalendarData>("calendar", { companyId, refreshKey });
+  const publishNow = usePluginAction("publish-now");
 
-  const refresh = useCallback(() => setRefreshKey((k) => k + 1), []);
+  const days = useMemo(() => windowDays(14), []);
+  const cal = data.data;
 
-  const handleApprove = useCallback(async (postId: string) => {
-    await approvePost({ postId, companyId });
-    refresh();
-  }, [approvePost, companyId, refresh]);
+  const unscheduled = cal?.byDate?.unscheduled ?? [];
 
-  const handleUnapprove = useCallback(async (postId: string) => {
-    await unapprovePost({ postId, companyId });
-    refresh();
-  }, [unapprovePost, companyId, refresh]);
-
-  const handleGenerateBatch = useCallback(async () => {
-    setGenerating(true);
-    setGenerateError(null);
+  async function onPublishNow(ref: string) {
+    if (!confirm(`Publish ${ref} now? This posts publicly and cannot be undone here.`)) return;
+    setBusy(ref);
+    setError(null);
     try {
-      await generateBatch({ companyId, daysCount: 10 });
-      refresh();
-    } catch (err) {
-      setGenerateError(err instanceof Error ? err.message : "Failed to generate batch");
+      await publishNow({ companyId, caseRef: ref });
+      setRefreshKey((k) => k + 1);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setGenerating(false);
+      setBusy(null);
     }
-  }, [generateBatch, companyId, refresh]);
+  }
 
-  const calendar = calendarData.data?.calendar ?? [];
-  const stats = statsData.data;
+  if (data.loading) return <p style={{ padding: 24, opacity: 0.7 }}>Loading calendar…</p>;
+  if (data.error) {
+    return (
+      <p style={{ padding: 24, color: "#dc2626" }}>
+        Could not load the calendar: {String(data.error)}
+      </p>
+    );
+  }
 
   return (
-    <div style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif", color: tokens.fg }}>
-      {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 12 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700 }}>Content Calendar</h2>
-          <p style={{ margin: "4px 0 0 0", fontSize: 14, color: tokens.muted }}>
-            Schedule and manage your X (Twitter) posts
-          </p>
-        </div>
-
+    <div style={{ padding: "20px 24px", fontFamily: "system-ui, sans-serif" }}>
+      <header style={{ display: "flex", alignItems: "baseline", gap: 20, marginBottom: 18 }}>
+        <h1 style={{ fontSize: 20, margin: 0 }}>Content Calendar</h1>
+        {cal && (
+          <span style={{ fontSize: 13, opacity: 0.65 }}>
+            {cal.stats.total} cases · {cal.stats.scheduled} scheduled ·{" "}
+            {cal.stats.approved} approved · {cal.stats.posted} posted
+          </span>
+        )}
         <button
-          onClick={handleGenerateBatch}
-          disabled={generating}
+          onClick={() => setRefreshKey((k) => k + 1)}
           style={{
-            padding: "10px 20px",
-            background: "oklch(0.35 0.12 280)",
-            border: `1px solid oklch(0.5 0.15 280)`,
-            borderRadius: 8,
-            color: "oklch(0.92 0.1 280)",
-            fontSize: 14,
-            fontWeight: 600,
-            cursor: generating ? "not-allowed" : "pointer",
-            opacity: generating ? 0.7 : 1,
-            whiteSpace: "nowrap",
+            marginLeft: "auto", fontSize: 12, padding: "5px 11px",
+            borderRadius: 6, border: "1px solid #d1d5db", cursor: "pointer",
+            background: "transparent", color: "inherit",
           }}
         >
-          {generating ? "Generating…" : "✨ Generate 10 Posts"}
+          Refresh
         </button>
-      </div>
+      </header>
 
-      {generateError && (
-        <div style={{
-          padding: "10px 14px",
-          background: "oklch(0.2 0.06 25)",
-          border: `1px solid oklch(0.4 0.15 25)`,
-          borderRadius: 8,
-          color: "oklch(0.82 0.13 25)",
-          fontSize: 13,
-          marginBottom: 16,
-        }}>
-          {generateError}
-        </div>
+      {error && (
+        <p style={{ color: "#dc2626", fontSize: 13, marginBottom: 12 }}>{error}</p>
       )}
 
-      {/* Stats */}
-      {stats && (
-        <div style={{ display: "flex", gap: 12, marginBottom: 24, flexWrap: "wrap" }}>
-          {[
-            { label: "Total", value: stats.total, color: tokens.muted },
-            { label: "Draft", value: stats.draft, color: "oklch(0.7 0.1 250)" },
-            { label: "Approved", value: stats.approved, color: "oklch(0.7 0.12 145)" },
-            { label: "Posted", value: stats.posted, color: "oklch(0.65 0.16 145)" },
-            { label: "Failed", value: stats.failed, color: "oklch(0.7 0.15 25)" },
-          ].map((stat) => (
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(7, minmax(0, 1fr))",
+          gap: 8,
+        }}
+      >
+        {days.map((iso) => {
+          const posts = cal?.byDate?.[iso] ?? [];
+          const isToday = iso === isoDate(new Date());
+          return (
             <div
-              key={stat.label}
+              key={iso}
               style={{
-                background: tokens.card,
-                border: `1px solid ${tokens.border}`,
+                minHeight: 132,
+                border: `1px solid ${isToday ? "#15803d" : "#e5e7eb"}`,
                 borderRadius: 8,
-                padding: "10px 16px",
-                minWidth: 80,
-                textAlign: "center",
+                padding: 8,
+                background: isToday ? "rgba(21,128,61,0.04)" : "transparent",
               }}
             >
-              <div style={{ fontSize: 22, fontWeight: 700, color: stat.color }}>{stat.value}</div>
-              <div style={{ fontSize: 12, color: tokens.muted }}>{stat.label}</div>
+              <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 6 }}>
+                {weekday(iso)} {dayNum(iso)}
+              </div>
+
+              {posts.length === 0 && (
+                <div style={{ fontSize: 11, opacity: 0.28 }}>—</div>
+              )}
+
+              {posts.map((p) => (
+                <div
+                  key={p.ref}
+                  style={{
+                    borderLeft: `3px solid ${STATUS_COLOUR[p.status] ?? "#6b7280"}`,
+                    paddingLeft: 7,
+                    marginBottom: 8,
+                    fontSize: 12,
+                    lineHeight: 1.35,
+                  }}
+                >
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <strong style={{ fontSize: 11 }}>{p.ref}</strong>
+                    <span style={{ fontSize: 10, opacity: 0.6 }}>{timeOf(p.publishAt)}</span>
+                    {p.hasMedia && <span title="has image" style={{ fontSize: 10 }}>🖼</span>}
+                  </div>
+
+                  <div style={{ opacity: 0.85, marginTop: 2 }}>
+                    {(p.caption ?? p.title).slice(0, 72)}
+                    {(p.caption ?? p.title).length > 72 ? "…" : ""}
+                  </div>
+
+                  <div style={{ fontSize: 10, opacity: 0.6, marginTop: 3 }}>
+                    {p.status.replace("_", " ")} · {p.charCount} ch
+                  </div>
+
+                  {p.published?.outcome === "posted" && (
+                    <a
+                      href={p.published.url ?? "#"}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{ fontSize: 10, color: "#15803d" }}
+                    >
+                      posted ↗
+                    </a>
+                  )}
+                  {p.published?.outcome === "failed" && (
+                    <div style={{ fontSize: 10, color: "#dc2626" }} title={p.published.error ?? ""}>
+                      failed
+                    </div>
+                  )}
+
+                  {p.status === "approved" && !p.published && (
+                    <button
+                      disabled={busy === p.ref}
+                      onClick={() => onPublishNow(p.ref)}
+                      style={{
+                        marginTop: 4, fontSize: 10, padding: "2px 7px",
+                        borderRadius: 4, border: "1px solid #15803d",
+                        color: "#15803d", background: "transparent",
+                        cursor: busy === p.ref ? "wait" : "pointer",
+                      }}
+                    >
+                      {busy === p.ref ? "posting…" : "post now"}
+                    </button>
+                  )}
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
+          );
+        })}
+      </div>
+
+      {unscheduled.length > 0 && (
+        <section style={{ marginTop: 22 }}>
+          <h2 style={{ fontSize: 13, opacity: 0.7, marginBottom: 8 }}>
+            No publish date ({unscheduled.length})
+          </h2>
+          <ul style={{ fontSize: 12, opacity: 0.8, paddingLeft: 18, margin: 0 }}>
+            {unscheduled.slice(0, 12).map((p) => (
+              <li key={p.ref} style={{ marginBottom: 3 }}>
+                <strong>{p.ref}</strong> — {p.title.slice(0, 70)}{" "}
+                <span style={{ opacity: 0.55 }}>({p.status.replace("_", " ")})</span>
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
 
-      {/* Calendar grid */}
-      {calendarData.loading && (
-        <div style={{ textAlign: "center", color: tokens.muted, padding: "40px 0" }}>Loading calendar…</div>
-      )}
-
-      {calendarData.error && (
-        <div style={{ color: "oklch(0.82 0.13 25)", padding: "16px 0" }}>
-          Failed to load calendar: {String(calendarData.error)}
-        </div>
-      )}
-
-      {!calendarData.loading && calendar.length > 0 && (
-        <div style={{ display: "flex", gap: 12, overflowX: "auto", paddingBottom: 16 }}>
-          {calendar.map((day) => (
-            <DayColumn
-              key={day.date}
-              day={day}
-              onEdit={setEditingPost}
-              onApprove={handleApprove}
-              onUnapprove={handleUnapprove}
-            />
-          ))}
-        </div>
-      )}
-
-      {/* Post editor modal */}
-      {editingPost && (
-        <PostEditor
-          post={editingPost}
-          companyId={companyId}
-          onClose={() => setEditingPost(null)}
-          onSaved={() => {
-            setEditingPost(null);
-            refresh();
-          }}
-        />
-      )}
+      <p style={{ fontSize: 11, opacity: 0.45, marginTop: 20 }}>
+        Content, media and approval live on the case. Approve a case to make it
+        publishable; the calendar only shows and sends.
+      </p>
     </div>
   );
 }

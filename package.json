@@ -24,7 +24,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@paperclipai/plugin-sdk": "^2026.817.0",
+    "@paperclipai/plugin-sdk": "file:/home/openclaw/.local/lib/node_modules/paperclipai/node_modules/@paperclipai/plugin-sdk",
     "zod": "^3.23.0"
   },
   "devDependencies": {
