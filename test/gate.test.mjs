@@ -217,7 +217,13 @@ test("a malformed paused value cannot silently halt the calendar", () => {
 test("scheduled publishing does not depend on companies.list invocation scope", async () => {
   const worker = await readFile(new URL("../src/worker.ts", import.meta.url), "utf8");
   assert.doesNotMatch(worker, /ctx\.companies\.list\(\)/);
-  assert.match(worker, /UNTRACE_COMPANY_ID/);
+  // The sweep is scoped by configuration, not by whichever company happened to
+  // invoke the plugin: the job resolves PAPERCLIP_CONTENT_CALENDAR_COMPANY_ID
+  // from the process environment and sweeps exactly that company.
+  const job = worker.slice(worker.indexOf("async function registerJobs("));
+  assert.match(job, /resolveScheduledCompanyId\(process\.env\)/);
+  assert.match(job, /publishSweep\(\s*ctx,\s*companyId,/);
+  assert.match(worker, /env\.PAPERCLIP_CONTENT_CALENDAR_COMPANY_ID/);
 });
 
 // --- 0.3.0 regressions -----------------------------------------------------

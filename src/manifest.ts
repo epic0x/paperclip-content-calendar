@@ -6,17 +6,15 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
  * The host derives this plugin's Postgres schema as
  *   plugin_<namespaceSlug>_<sha256(PLUGIN_ID).slice(0,10)>
  * which for these two values is
- *   plugin_content_calendar_cc002f61cd
+ *   plugin_content_calendar_f2583e060b
  * and that literal name is hard-coded in migrations/001_publish_log.sql.
  * Changing PLUGIN_ID or NAMESPACE_SLUG changes the hash and breaks every
  * migration statement. If you must change them, recompute the namespace first.
  */
-export const PLUGIN_ID = "untrace.plugin-content-calendar";
-export const PLUGIN_VERSION = "0.4.0";
-/** This private deployment serves the single Untrace Network company. */
-export const UNTRACE_COMPANY_ID = "b276d33f-a226-4fd1-95fa-b3f3114ccd9d";
+export const PLUGIN_ID = "epic0x.plugin-content-calendar";
+export const PLUGIN_VERSION = "0.5.0";
 export const NAMESPACE_SLUG = "content_calendar";
-export const DB_NAMESPACE = "plugin_content_calendar_cc002f61cd";
+export const DB_NAMESPACE = "plugin_content_calendar_f2583e060b";
 
 export const PAGE_SLOT_ID = "content-calendar-page";
 export const PAGE_EXPORT_NAME = "ContentCalendarPage";
@@ -63,7 +61,7 @@ const manifest: PaperclipPluginManifestV1 = {
   displayName: "Content Calendar",
   description:
     "Month calendar for social_post cases plus a publish job. Cases stay the source of truth: this plugin reads them, lays them out by publish_at, and records what it published. It does not author or duplicate content.",
-  author: "Untrace Network",
+  author: "Epic0x",
   categories: ["automation", "ui"],
 
   capabilities: [

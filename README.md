@@ -1,192 +1,96 @@
 # Content Calendar — a Paperclip plugin
 
-A month calendar for `social_post` cases, plus a job that publishes them when
-they are approved and due. Selecting a post opens an editor panel that can do
-the whole job — text, alt text, status, image, schedule, publish — so the Cases
-page is never a required stop.
+A month calendar and a list view for `social_post` cases, plus a job that
+publishes them when they are approved and due.
 
 **Cases stay the source of truth.** This plugin does not author content, does
-not copy captions into its own table, and does not invent its own approval
-flag. It reads cases over the Paperclip API, lays them out by date, and records
-what it published.
+not copy captions into its own tables, and does not invent its own approval
+flag. It reads cases over the Paperclip API, lays them out by `publish_at`, and
+records what it published.
+
+```bash
+npm install @epic0x/paperclip-plugin-content-calendar
+```
 
 ---
 
-## Why it is built this way
+## Features
 
-Paperclip already ships most of what a content calendar needs, under different
-names. Before writing anything we audited the live instance
-(`Agents/paperclip-native-scheduling.md` in the knowledge graph):
+- **Month grid and List view.** The grid places every `social_post` case on its
+  Asia/Dubai publish day. List view is flat and uncapped — soonest first,
+  undated posts last — so nothing is hidden behind a per-day limit.
+- **Post editor panel.** Selecting a post opens a panel that does the whole
+  job: caption, alt text, case status, media, reschedule, publish. The Cases
+  page is never a required stop.
+- **Image and video attachments.** PNG, JPEG, WebP and GIF images, and MP4 and
+  QuickTime video, uploaded through Paperclip's native case-attachment
+  endpoint. Cards render an image or a video preview from the recorded
+  `media_type`.
+- **Scheduling on half-hour slots.** Both the UI and the server round
+  `publish_at` to `:00` / `:30` in Asia/Dubai, which is what lets a twice-hourly
+  job run with no drift. Storage stays a UTC instant.
+- **Publish job.** Twice an hour the job finds approved cases whose
+  `publish_at` has arrived and publishes them, recording every decision.
+- **Post Now**, for publishing one case immediately through the same gate.
+- **An append-only publish log**, with a database-enforced interlock that makes
+  double-posting impossible.
 
-| Need | Already in Paperclip | So we |
-| --- | --- | --- |
-| Recurring job engine | `plugin_jobs`, and `routines` with cron, timezone, catch-up and concurrency policies | declare a job, write no scheduler |
-| Approval | native case status `approved`, indexed, emits `status_changed` events | read `status === "approved"` |
-| Approval audit | `case_events`, `approvals` | write nothing extra |
-| Content storage | `cases` + `case_documents` + `case_attachments` | never duplicate a case |
-| **Publish date** | **nothing** | read `fields.publish_at` |
-| **Calendar view** | **nothing** | this plugin |
-| **Publisher** | **nothing** | this plugin |
-| Image storage | `assets` + `case_attachments`, and `POST /cases/:id/attachments` | upload through the native endpoint, store nothing ourselves |
-
-The three "nothing" rows are the entire scope.
-
-### Approval is the case status, not a field
-
-Our team previously tracked approval in `fields.approved` — a JSON string on
-78 cases, `"true"` on exactly zero of them. Paperclip has a real `approved`
-lifecycle status that is indexed and event-logged. The gate reads the native
-status. `fields.approved` is ignored.
-
-Reviewers move a case to **Approved** in the Paperclip UI. That is the whole
-handoff.
+X publishing is optional: with no channel configured this is a working calendar
+and publish log that records `skipped / no configured adapter` instead of
+posting.
 
 ---
 
-## The editor panel
+## Requirements
 
-Clicking a post opens a panel on the right. It holds:
-
-- **Caption and alt text** — a textarea and an input with one explicit **Save**.
-  Unsaved edits are marked, and the result of the save is stated inline. Nothing
-  auto-saves.
-- **Status** — a dropdown of the four review states (Draft, In review, Approved,
-  Cancelled). This writes the **native** `cases.status`, the same field the
-  Paperclip case page writes, emitting the same `status_changed` event. `done`
-  and `in_progress` are not offered: a post becomes done by being published.
-  `PANEL_STATUSES` in `src/cases.ts` is the single list, shared by the dropdown
-  and the worker's validation, so the UI cannot offer a transition the worker
-  would refuse.
-- **Image** — a bounded preview of the attached image, read straight from the
-  native asset content endpoint, with the case's alt text on the `<img>`. Empty,
-  legacy and failed-to-load states each say what is actually true rather than
-  showing a broken frame.
-- **Replace image** — a file picker that uploads to Paperclip and repoints the
-  case at the new asset.
-- **Schedule and Post Now** — unchanged from 0.2.x.
-
-### How an image replacement actually works
-
-Traced from the installed server rather than guessed:
-
-1. The browser posts the file to **`POST /api/cases/:id/attachments`**
-   (`server/dist/routes/cases.js`) as `multipart/form-data` with the field name
-   `file`. That one call creates the `assets` row, links it to the case through
-   `case_attachments`, and records an `attachment_added` case event.
-2. Only after that succeeds does the plugin worker write
-   `fields.media_file = "asset:<uuid>"` (plus alt text) with a **merged** patch.
-
-The ordering is the safety property: **the previous image stays attached and
-stays referenced until the new one is in place.** A failed upload changes
-nothing.
-
-Two details worth keeping:
-
-- **The upload is a browser `fetch` with `credentials: "include"`, and that is
-  deliberate.** Plugin UI is served from `/_plugins/:pluginId/ui/*` and imported
-  as an ES module into the host document, so it is same-origin and carries the
-  operator's session — which is exactly how Paperclip's own UI uploads files
-  (`postForm` → `fetch("/api"+path, {credentials:"include"})`, with no
-  `Content-Type` header so the browser can set the multipart boundary). Sending
-  bytes through the plugin bridge instead is not an option: that path is JSON
-  with a 10 MB body limit, and base64 of a 10 MB image is ~13.3 MB.
-- **The worker re-checks the link before repointing `media_file`.** It reads the
-  case back and refuses an asset that is not actually attached to it, so a
-  crafted action call cannot point a case at an arbitrary asset id.
-
-### Validation
-
-`POST /cases/:id/attachments` enforces the company's byte cap and rejects an
-empty body, but — unlike `/companies/:id/assets/images` — it does **not** check
-the content type. So the plugin checks it: PNG, JPEG, WebP and GIF only, the
-image subset of Paperclip's own `DEFAULT_ALLOWED_TYPES`. SVG is excluded
-because only the assets/images route sanitises SVG, and no channel we publish to
-accepts it. The size limit shown in the panel is the real
-`companies.attachment_max_bytes`, read through the plugin's `coreReadTables`
-access rather than hardcoded.
-
-### Publishing a native attachment
-
-The X adapter publishes from a **file path** — it owns the OAuth1 v1.1 multipart
-media upload and is the one part of this system proven end to end. So when
-`media_file` is an `asset:<uuid>` reference, `src/media.ts` downloads the bytes
-from the native content endpoint into a temp file for the length of one publish
-and deletes it afterwards. A legacy host path is handed through untouched, so
-every case that already publishes keeps publishing the same way. A download
-failure is recorded as a **failed** attempt — never a text-only post of a case
-that was meant to carry an image.
-
-### One request per selection
-
-`attachments` only exists on `GET /api/cases/:id`; the case **list** endpoint
-returns bare rows. Projecting attachments onto every chip would therefore cost
-one API round trip per post on every render of the month. Instead the
-`case-detail` data handler is called by the panel, which is mounted only while a
-card is selected — so the grid stays one request and detail is read once per
-selection.
+- **Paperclip 2026.821.0-canary.11 or newer.** That is the `@paperclipai/plugin-sdk`
+  version this plugin is built against; the plugin API version it declares is 1.
+- **Node.js 22 or newer**, on the machine running the Paperclip host. X
+  publishing is bundled Node code and needs no second language runtime.
+- **A board API key**, for reading cases over the authenticated API.
 
 ---
 
-## What it stores
+## Installation
 
-One schema, `plugin_content_calendar_cc002f61cd`, derived by the host. Two
-tables, neither of which duplicates a case:
+Install the package, then install the built plugin directory into your
+Paperclip instance:
 
-- **`publish_attempts`** — append-only. One row per attempt with the outcome
-  (`sent` / `dry_run` / `failed` / `skipped`), the reason, the caption hash at
-  attempt time, and the raw adapter response. A partial unique index on
-  `outcome = 'sent'` means a case can only ever be sent once; a duplicate raises
-  a constraint violation instead of double-posting.
-- **`schedule_overrides`** — records a reschedule intent before writing
-  `publish_at` back to the case, so a failed write-back is visible rather than
-  lost.
+```bash
+npm install @epic0x/paperclip-plugin-content-calendar
 
-`cases` is **not** in the host's `coreReadTables` whitelist, so it cannot be
-read from plugin SQL at all. Case access goes over the authenticated HTTP API,
-which is why a board API key is required.
+# confirm which instance you are pointing at before you change it
+paperclipai plugin target
 
----
+paperclipai plugin install ./node_modules/@epic0x/paperclip-plugin-content-calendar
+paperclipai plugin inspect epic0x.plugin-content-calendar
+```
 
-## The publish gate
+`plugin install` copies built output from disk — nothing is compiled on the
+server, and the installed plugin directory has no `node_modules`. `inspect`
+should report status `active` and the two migrations applied.
 
-Every reason to publish or not lives in one pure function (`src/gate.ts`), in
-this order:
+### Required environment variable
 
-1. already sent (unique index) → `skipped`
-2. case already has a `publish_url` → `skipped`
-3. case is `cancelled` or `done` → `skipped`
-4. **case status is not `approved`** → `skipped`
-5. no caption → `skipped`
-6. no channel, channel not enabled in config, or no configured adapter → `skipped`
-7. no `publish_at`, unparseable, or not due yet → `skipped`
-8. overdue beyond `lookbackHours` → `skipped` (reschedule rather than post late)
-9. **the emergency pause is on → `dry_run`** — evaluated, recorded, nothing sent
-10. otherwise → `publish`
+The scheduled sweep needs to know whose posts to publish. Set this in the
+environment of the **Paperclip host process**, not in plugin config:
 
-**There is no per-post arming switch.** Approved + a publish date that has
-arrived is the entire contract (JC, 2026-08-23: *"if something is approved and
-we set a scheduled date, then it will go if it's green"*). The old `autoPost`
-flag meant "this post has no date, publish it daily at a fixed time" — a concept
-that died once every case carried its own `publish_at`.
+```bash
+PAPERCLIP_CONTENT_CALENDAR_COMPANY_ID=<company uuid>
+```
 
-`paused` is an instance-wide emergency stop, default off. It halts every route
-including Post Now, because a stop a button can walk past is not a stop.
+There is no default. Unset or malformed, the job throws an error naming the
+variable rather than silently sweeping nothing. The interactive surfaces — the
+calendar, the panel, Post Now — pass the company through from the UI and do not
+use it.
 
----
+**Finding the company uuid:** open the company in the Paperclip UI and read it
+out of the address bar, or ask the API with your board API key:
 
-## Worker surface
-
-| Kind | Key | What it does |
-| --- | --- | --- |
-| data | `calendar` | Every `social_post` case, grouped by Dubai day. One API read. |
-| data | `case-detail` | One case with its native attachments and the upload limits. Called only while a card is selected. |
-| data | `attempts` | Recent publish attempts, newest first. |
-| data | `status` | Config health, so the UI can explain itself instead of rendering empty. |
-| action | `save-content` | Writes caption / alt text as a merged field patch. |
-| action | `set-status` | Writes the native case status. Only `PANEL_STATUSES`. |
-| action | `set-media` | Repoints `media_file` at an asset already attached to the case. Refuses anything else. |
-| action | `reschedule` | Moves `publish_at`, server-enforced to a Dubai `:00`/`:30` slot. |
-| action | `post-now` | Publishes one case through the same gate as the cron sweep, with `manual: true`. |
+```bash
+curl -s -H "Authorization: Bearer $BOARD_API_KEY" \
+  http://127.0.0.1:3100/api/companies
+```
 
 ---
 
@@ -196,88 +100,179 @@ Set on the plugin's settings page after install:
 
 | Key | Required | Meaning |
 | --- | --- | --- |
-| `apiBaseUrl` | yes | Where to reach the Cases API. Use the loopback origin, e.g. `http://127.0.0.1:3100`. |
-| `boardApiKeyRef` | yes | Secret **reference** to a board API key (`paperclipai token board create`). Resolved per call, never cached or logged. Without it the calendar shows a clear "not configured" notice instead of rendering empty. |
-| `paused` | no | Default `false`. Emergency stop for the whole instance. Not a per-post switch. |
-| `channels` | no | Channel keys the job may send to. A case on an unlisted channel is skipped with a reason. |
-| `lookbackHours` | no | Default 6. How late a missed post may still go out. |
+| `apiBaseUrl` | yes | Where the plugin reaches the Cases API. Use the loopback origin of your own host, e.g. `http://127.0.0.1:3100`. |
+| `boardApiKeyRef` | yes | Secret **reference** to a board API key (`paperclipai token board create`). Without it the calendar shows a "not configured" notice instead of rendering empty. |
+| `paused` | no | Default `false`. Instance-wide emergency stop. |
+| `channels` | no | Channel keys the publish job may send to. A case on an unlisted channel is skipped with a reason. |
+| `xCredentials` | no | Secret references for the X OAuth 1.0a set: API key, API secret, access token, access secret. All four are needed to post to X. |
+| `lookbackHours` | no | Default `6`. How late a missed post may still go out. |
 
----
+### Secret references
 
-## Channel adapters
+Credentials are configured as secret **references**, never as literal values.
+The host resolves a reference per call; the plugin does not cache it, does not
+write it to its own tables, and does not log it. Create the secret in Paperclip
+first, then point the setting at it.
 
-`src/channels.ts` defines the `ChannelAdapter` contract.
+### Channels
 
-**X** delegates to the host publish script, which owns the OAuth1 credentials
-and the v1.1 multipart media upload; the token never enters this process, the
-plugin config, or the database. It reports `isConfigured: false` when that
-script is absent, so the job records `skipped / no configured adapter` rather
-than pretending to have posted.
-
-**LinkedIn** stays unimplemented on purpose: the only token we hold is
-`w_member_social`, which posts to a personal profile rather than the company
-page. It reports `isConfigured: false` until the Community Management API
-application is approved.
+`src/channels.ts` defines the `ChannelAdapter` contract. **X** is the one
+adapter shipped. Its bundled Node publisher owns OAuth 1.0a signing, image
+multipart upload, and the `INIT` / `APPEND` / `FINALIZE` / `STATUS` video
+protocol. An adapter reports `isConfigured: false` when its secret references
+are incomplete, and the job records `skipped` rather than pretending to have
+posted. **LinkedIn** is declared but unimplemented.
 
 To add an adapter: implement `publish`, make `isConfigured` check for the
-resolved credential, and register it in `ADAPTERS`. Put the credential in plugin
-config as a secret reference — never in the source.
+resolved credential, and register it in `ADAPTERS`. Put the credential in
+plugin config as a secret reference — never in source.
+
+### Upgrading
+
+```bash
+npm install @epic0x/paperclip-plugin-content-calendar@latest
+paperclipai plugin target
+paperclipai plugin install ./node_modules/@epic0x/paperclip-plugin-content-calendar
+paperclipai plugin inspect epic0x.plugin-content-calendar
+```
+
+Migrations are additive within the Epic0x plugin identity and are applied by the
+host on install. Version 0.5.0 starts a fresh database namespace; it does not
+import state from a differently named installation. Check `inspect` reports the
+new version and status `active`.
+
+### Uninstalling
+
+```bash
+paperclipai plugin uninstall epic0x.plugin-content-calendar
+```
+
+Removing the plugin stops the job and the UI surfaces. It does **not** drop the
+plugin's schema — the publish log is an audit record and outlives the install.
+Drop `plugin_content_calendar_f2583e060b` by hand if you want the history gone,
+and unset `PAPERCLIP_CONTENT_CALENDAR_COMPANY_ID`. No case is modified by an
+uninstall.
 
 ---
 
-## Build and install
+## Cases and the native schema
 
-**Never build on the agent hosts.** Both droplets are 1–2 GB RAM with under
-5 GB free; a single `npm install` has taken the gateway down before. CI builds
-the artifact:
+The plugin reads and writes Paperclip's own case model. It adds no case table
+of its own.
 
-```bash
-# in CI (.github/workflows/build.yml)
-npm install && npx tsc --noEmit && npm run build
-node scripts/verify-namespace.mjs      # schema name must match the derived one
-```
+- **Case type:** `social_post`.
+- **Approval is the native case status.** A case publishes when
+  `cases.status === "approved"` — the indexed, event-logged lifecycle status
+  that the Paperclip case page writes. There is no separate approval field.
+- **Fields it reads and writes**, all inside `cases.fields`: `publish_at` (the
+  scheduled instant), `channel`, `caption`, `alt_text`, `media_file`,
+  `media_type`, and `publish_url`, written back after a successful send.
+  `media_file` must be a native `asset:<uuid>` reference; host-local paths are
+  rejected because they cannot survive installation on another machine.
+- **`cases.fields` is replaced wholesale on PATCH, never deep-merged.** Every
+  write this plugin makes reads the case first and sends a merged object.
+- **Media is stored by Paperclip**, through `POST /api/cases/:id/attachments`,
+  which creates the asset, links it to the case and logs the event. Only after
+  that succeeds does the plugin repoint `media_file`. A failed upload changes
+  nothing, and the previous media stays attached.
 
-Then on the Paperclip host:
+## Publish safety
 
-```bash
-tar -xzf paperclip-content-calendar.tar.gz -C ~/plugins
-paperclipai plugin target                       # confirm which instance
-paperclipai plugin install ~/plugins/paperclip-content-calendar
-paperclipai plugin inspect untrace.plugin-content-calendar
-```
+Every reason to publish or not lives in one pure function, `src/gate.ts`,
+evaluated in this order:
 
-`plugin install` reads built output from disk — no compilation happens on the
-server.
+1. already sent → `skipped`
+2. the case already carries a `publish_url` → `skipped`
+3. the case is `cancelled` or `done` → `skipped`
+4. the case status is not `approved` → `skipped`
+5. no caption → `skipped`
+6. no channel, channel not enabled in config, or no configured adapter → `skipped`
+7. no `publish_at`, unparseable, or not due yet → `skipped`
+8. overdue beyond `lookbackHours` → `skipped` — reschedule rather than post late
+9. `paused` is on → `dry_run`: evaluated and recorded, nothing sent
+10. otherwise → publish
 
-### The namespace trap
+Three interlocks sit under that:
 
-The host derives the schema name as
-`plugin_<slug>_<sha256(pluginId)[0:10]>`. The migration SQL hardcodes it.
-Change `PLUGIN_ID` or `NAMESPACE_SLUG` and every migration statement is
-rejected as out-of-namespace, leaving the plugin in `error` status.
-`scripts/verify-namespace.mjs` runs in CI to catch that before it reaches a
-server, and the worker logs a loud error at startup if `ctx.db.namespace`
-disagrees with the compiled constant.
+- **A partial unique index on `outcome = 'sent'`** means a case can be sent at
+  most once. A late, duplicated or concurrent job run hits a constraint
+  violation instead of double-posting.
+- **`paused` halts every route**, including Post Now. A stop a button can walk
+  past is not a stop.
+- **A media download failure is recorded as `failed`**, never downgraded to a
+  text-only post of a case that was meant to carry an image or video.
+
+## Requested capabilities
+
+The manifest asks the host for exactly these, and nothing broader:
+
+| Capability | Why |
+| --- | --- |
+| `companies.read` | Read the company row for attachment limits and context. |
+| `projects.read` | Read project context for a case. |
+| `database.namespace.migrate` | Create the plugin's two tables on install. |
+| `database.namespace.read` | Read the publish log and schedule overrides. |
+| `database.namespace.write` | Append publish attempts and overrides. |
+| `jobs.schedule` | Register the twice-hourly publish job. |
+| `http.outbound` | Reach the Paperclip Cases API and the channel adapter. |
+| `secrets.read-ref` | Resolve the board API key and channel credentials from references. |
+| `activity.log.write` | Leave an audit trail in the Paperclip activity log. |
+| `ui.page.register` | The calendar page. |
+| `ui.sidebar.register` | The sidebar entry. |
+| `ui.dashboardWidget.register` | The "Upcoming posts" widget. |
+| `ui.action.register` | The panel's save, status, media, reschedule and publish actions. |
+
+Note that `cases` is deliberately **not** in the plugin's `coreReadTables`
+whitelist — it is not readable from plugin SQL at all. Case access goes over the
+authenticated HTTP API, which is why a board API key is required.
+
+## What it stores
+
+One host-derived schema, `plugin_content_calendar_f2583e060b`, with two tables.
+Neither duplicates a case:
+
+- **`publish_attempts`** — append-only, one row per attempt: the case id and
+  identifier, the channel, the `publish_at` at attempt time, the outcome
+  (`sent` / `dry_run` / `failed` / `skipped`), the reason, the resulting post
+  URL, a SHA-256 hash of the caption as sent, and the raw adapter response.
+  Never updated in place, never deleted.
+- **`schedule_overrides`** — one row per reschedule made from the calendar,
+  recorded before `publish_at` is written back to the case, so a failed
+  write-back is visible rather than lost.
+
+No captions, no media bytes, and no credentials are stored by this plugin.
+
+## Security
+
+Plugin UI is served same-origin and runs with the operator's session, and this
+plugin can publish to public networks — review it before installing it, as you
+should any Paperclip plugin.
+
+Report vulnerabilities privately to `contact@untrace.network`. Do not open a
+public issue for a vulnerability or a leaked secret. See
+[SECURITY.md](SECURITY.md).
 
 ---
 
-## Pitfalls worth knowing
+## Development
 
-- **`cases.fields` is replaced wholesale on PATCH, never deep-merged.** Sending
-  `{ publish_url }` alone destroys caption, channel and publish_at.
-  `patchCaseFields()` always reads first and sends the merged object.
-- **Cases are experimental**, gated on `experimental.enableCases`. A
-  `403 Cases are disabled` means an operator turned it off.
-- **`POST /cases` upserts on `(caseType, key)`** — `200` updates, `201`
-  creates. Retries converge only with a deterministic key.
-- **The calendar displays and accepts Asia/Dubai time (UTC+4).** `publish_at`
-  remains a UTC instant in storage. Both the worker's day grouping and the UI's
-  Today marker, labels, input value, and save conversion use the same Dubai
-  helper module, so posts around midnight stay on the correct local date.
-- **Plugin UI is same-origin, not sandboxed.** That is what makes the native
-  upload work at all — and a reason not to install third-party plugins casually.
-- **`POST /cases/:id/attachments` does not validate content type.** Only
-  `/companies/:id/assets/images` does. Anything relying on the server to reject
-  a non-image is relying on a check that is not there.
-- **`media_file` may be an `asset:<uuid>` reference or a legacy host path.**
-  Both publish. `parseAssetRef()` is the only place that tells them apart.
+```bash
+npm install
+npm run build          # esbuild → dist/
+npm run typecheck      # tsc --noEmit
+npm test               # node --test test/*.test.mjs
+npm run verify:namespace
+```
+
+`verify:namespace` checks that the schema name hardcoded in
+`migrations/001_publish_log.sql` still matches the one the host derives as
+`plugin_<namespaceSlug>_<sha256(pluginId)[0:10]>`. Changing `PLUGIN_ID` or
+`NAMESPACE_SLUG` changes that hash and makes every migration statement fail as
+out-of-namespace, so the check runs in CI before anything reaches a server.
+
+Issues and pull requests:
+<https://github.com/epic0x/paperclip-content-calendar>.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

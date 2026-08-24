@@ -1,18 +1,39 @@
 {
-  "name": "@untrace/paperclip-plugin-content-calendar",
-  "version": "0.4.0",
+  "name": "@epic0x/paperclip-plugin-content-calendar",
+  "version": "0.5.0",
   "description": "Content calendar and publish scheduler for Paperclip. Reads social_post cases, renders them on a month grid, and publishes approved cases when due.",
   "type": "module",
-  "private": true,
   "license": "MIT",
+  "author": "Epic0x",
+  "homepage": "https://github.com/epic0x/paperclip-content-calendar#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/epic0x/paperclip-content-calendar.git"
+  },
+  "bugs": {
+    "url": "https://github.com/epic0x/paperclip-content-calendar/issues"
+  },
+  "keywords": [
+    "paperclip",
+    "paperclip-plugin",
+    "content-calendar",
+    "scheduler",
+    "social"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "dist",
     "migrations",
-    "scripts",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "!**/*.map"
   ],
   "exports": {
-    ".": "./src/manifest.ts"
+    ".": "./dist/manifest.js"
   },
   "paperclipPlugin": {
     "manifest": "./dist/manifest.js",
@@ -21,6 +42,7 @@
   },
   "scripts": {
     "build": "node ./esbuild.config.mjs",
+    "prepack": "npm run build",
     "dev": "node ./esbuild.config.mjs --watch",
     "typecheck": "tsc --noEmit",
     "verify:namespace": "node ./scripts/verify-namespace.mjs",

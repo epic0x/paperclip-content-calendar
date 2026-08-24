@@ -1,0 +1,27 @@
+name: Publish npm package
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    if: github.repository == 'epic0x/paperclip-content-calendar'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - run: npm install
+      - run: npm run verify:namespace
+      - run: npm run build
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm publish --access public
