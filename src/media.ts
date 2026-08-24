@@ -10,10 +10,10 @@
  *
  *   media_file = "asset:<uuid>"  → download from /api/assets/<uuid>/content,
  *                                  write a temp file, delete it afterwards
- *   media_file = anything else   → hand it through untouched, so every case
- *                                  that already publishes from a host path
- *                                  keeps publishing exactly as it did
+ *   media_file = null            → publish text only
+ *   media_file = anything else   → reject before the channel adapter runs
  *
+ * Durable host-local paths are not portable across Paperclip installations.
  * A download failure THROWS. Posting a visual case as text-only because the
  * image could not be fetched is worse than not posting it, which is the same
  * rule the adapter already applies to a missing file.
@@ -110,12 +110,15 @@ export function tempFileNameFor(
 }
 
 export async function resolveMediaForPublish(
-  mediaFile: string | null,
+  mediaFile: string | null | undefined,
   deps: MediaDeps,
 ): Promise<ResolvedMedia> {
+  if (typeof mediaFile !== "string" || mediaFile.trim() === "") {
+    return { path: null, assetId: null, cleanup: noop };
+  }
   const assetId = parseAssetRef(mediaFile);
   if (!assetId) {
-    return { path: mediaFile ?? null, assetId: null, cleanup: noop };
+    throw new Error("media_file must reference a native Paperclip asset");
   }
   const asset = await deps.downloadAsset(assetId);
   const path = await deps.writeTempFile(

@@ -461,7 +461,7 @@ export function assertAttachedAsset(
  * through Paperclip's UI is a perfectly real attachment that `set-media` used
  * to accept and record. What that produced was a post that looks attached and
  * is not: `cardMedia` renders nothing for it, `selectedMedia` previews nothing
- * for it, and x_publish.py refuses the extension at publish time — which is the
+ * for it, and the X publisher refuses the extension at publish time — which is the
  * one moment nobody is watching.
  *
  * So the refusal happens here, while the operator is still standing in front of

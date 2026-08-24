@@ -10,7 +10,7 @@
  *
  *   - `cardMedia` reads media_type null → the month card shows nothing,
  *   - `selectedMedia` → the panel previews nothing,
- *   - x_publish.py rejects `.webm` at publish time,
+ *   - the X publisher rejects `.webm` at publish time,
  *
  * i.e. a post that looks attached right up until the moment it is due. The
  * refusal has to happen where the operator is still standing there — before the

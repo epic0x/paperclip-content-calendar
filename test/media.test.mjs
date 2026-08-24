@@ -1,11 +1,10 @@
 /**
- * Publishing a natively-attached image.
+ * Publishing natively attached media.
  *
- * The X adapter hands a FILE PATH to the publish script (src/channels.ts), and
- * that must not change — it owns the OAuth1 v1.1 media upload and is proven end
- * to end. So when `media_file` points at a Paperclip asset, the bytes are
- * fetched from the native content endpoint and materialised in a temp file just
- * for the duration of the post. Legacy host paths keep working untouched.
+ * The Node X adapter takes a temporary file path, but durable media identity is
+ * always a Paperclip asset reference. Asset bytes are fetched from the native
+ * content endpoint and materialised only for the duration of one attempt.
+ * Host-local filenames are rejected by the fresh public plugin.
  */
 
 import test from "node:test";
@@ -43,15 +42,16 @@ function makeDeps(state, opts = {}) {
   };
 }
 
-test("a legacy host filename publishes exactly as before, with no download", async () => {
+test("a host-local media path is rejected before publishing", async () => {
   const state = deps();
-  const media = await resolveMediaForPublish("2026-08-24-launch.png", makeDeps(state));
 
-  assert.equal(media.path, "2026-08-24-launch.png");
-  assert.equal(media.assetId, null);
+  await assert.rejects(
+    resolveMediaForPublish("2026-08-24-launch.png", makeDeps(state)),
+    /Paperclip asset/i,
+  );
   assert.deepEqual(state.downloaded, []);
-  await media.cleanup();
-  assert.deepEqual(state.removed, [], "nothing temporary was created");
+  assert.deepEqual(state.written, []);
+  assert.deepEqual(state.removed, []);
 });
 
 test("a native asset is materialised in a temp file and cleaned up afterwards", async () => {
@@ -83,12 +83,17 @@ test("a failed download stops the post rather than publishing it text-only", asy
   assert.deepEqual(state.written, []);
 });
 
-test("a case with no media resolves to nothing at all", async () => {
-  const state = deps();
-  const media = await resolveMediaForPublish(null, makeDeps(state));
-  assert.equal(media.path, null);
-  assert.deepEqual(state.downloaded, []);
-  await media.cleanup();
+test("an absent or blank media field resolves to text-only publishing", async () => {
+  for (const mediaFile of [null, undefined, "", "   "]) {
+    const state = deps();
+    const media = await resolveMediaForPublish(mediaFile, makeDeps(state));
+    assert.equal(media.path, null);
+    assert.equal(media.assetId, null);
+    await media.cleanup();
+    assert.deepEqual(state.downloaded, []);
+    assert.deepEqual(state.written, []);
+    assert.deepEqual(state.removed, []);
+  }
 });
 
 test("a jpeg asset gets a .jpg temp file", async () => {

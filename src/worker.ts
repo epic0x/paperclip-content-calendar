@@ -10,12 +10,7 @@ import {
   type PluginContext,
   type PluginJobContext,
 } from "@paperclipai/plugin-sdk";
-import {
-  DB_NAMESPACE,
-  JOB_PUBLISH_DUE,
-  PLUGIN_ID,
-  UNTRACE_COMPANY_ID,
-} from "./manifest.js";
+import { DB_NAMESPACE, JOB_PUBLISH_DUE, PLUGIN_ID } from "./manifest.js";
 import {
   CasesNotConfiguredError,
   PANEL_STATUSES,
@@ -267,7 +262,10 @@ async function registerDataHandlers(ctx: PluginContext): Promise<void> {
         return {
           channel: c,
           hasAdapter: Boolean(a),
-          configured: a ? await a.isConfigured(ctx, cfg) : false,
+          configured:
+            a && companyId
+              ? await a.isConfigured(ctx, cfg, companyId)
+              : false,
         };
       }),
     );
@@ -714,7 +712,9 @@ async function attemptOne(
   opts: { manual: boolean; alreadySent: boolean; now: Date },
 ): Promise<AttemptResult> {
   const adapter = adapterFor(entry.channel);
-  const adapterReady = adapter ? await adapter.isConfigured(ctx, cfg) : false;
+  const adapterReady = adapter
+    ? await adapter.isConfigured(ctx, cfg, companyId)
+    : false;
 
   const decision = evaluate({
     entry,
@@ -745,12 +745,11 @@ async function attemptOne(
 
   // decision.outcome === "publish"
   //
-  // The adapter publishes from a FILE PATH. When media_file is a native asset
-  // reference the bytes are fetched from Paperclip and written to a temp file
-  // for the length of this post; a legacy host path is handed through
-  // unchanged, so everything that already publishes keeps publishing the same
-  // way. A download failure is recorded as a failed attempt — never a
-  // text-only post of a case that was meant to carry an image.
+  // The adapter publishes from a FILE PATH. Native asset bytes are fetched
+  // from Paperclip and written to a temp file only for this attempt. Any other
+  // durable media reference is rejected before the adapter runs. A download
+  // failure is recorded as a failed attempt — never a text-only post of a case
+  // that was meant to carry media.
   let media: ResolvedMedia;
   try {
     media = await resolveMediaForPublish(entry.mediaFile, mediaDeps(ctx, cfg, companyId));
@@ -771,11 +770,16 @@ async function attemptOne(
 
   let result;
   try {
-    result = await (adapter as NonNullable<typeof adapter>).publish(ctx, cfg, {
-      entry,
-      caption: entry.caption as string,
-      mediaFile: media.path,
-    });
+    result = await (adapter as NonNullable<typeof adapter>).publish(
+      ctx,
+      cfg,
+      companyId,
+      {
+        entry,
+        caption: entry.caption as string,
+        mediaFile: media.path,
+      },
+    );
   } finally {
     await media.cleanup().catch((err: unknown) => {
       ctx.logger.warn(
@@ -952,13 +956,41 @@ async function publishSweep(
 // Jobs
 // ---------------------------------------------------------------------------
 
+/** Conventional uuid: hex 8-4-4-4-12, either case. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The company the scheduled sweep runs for, read from the environment it is
+ * handed rather than from a constant compiled into the plugin.
+ *
+ * Pure: it touches nothing but its argument, so a caller can pass
+ * `process.env` per invocation and a corrected value takes effect on the next
+ * tick. There is no default — an unset or malformed value is an operator
+ * mistake, and the error names the variable so the job log says what to set
+ * instead of reporting a database miss for a company that is not there.
+ */
+export function resolveScheduledCompanyId(
+  env: Record<string, unknown> | NodeJS.ProcessEnv,
+): string {
+  const raw = env.PAPERCLIP_CONTENT_CALENDAR_COMPANY_ID;
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new Error(
+      "PAPERCLIP_CONTENT_CALENDAR_COMPANY_ID is not set: the scheduled publish job needs the uuid of the company whose posts it should sweep.",
+    );
+  }
+  const companyId = raw.trim();
+  if (!UUID_RE.test(companyId)) {
+    throw new Error(
+      `PAPERCLIP_CONTENT_CALENDAR_COMPANY_ID is not a valid company uuid: ${JSON.stringify(companyId)}`,
+    );
+  }
+  return companyId;
+}
+
 async function registerJobs(ctx: PluginContext): Promise<void> {
   ctx.jobs.register(JOB_PUBLISH_DUE, async (job: PluginJobContext) => {
-    await publishSweep(
-      ctx,
-      UNTRACE_COMPANY_ID,
-      `job:${job.jobKey}:${job.trigger}`,
-    );
+    const companyId = resolveScheduledCompanyId(process.env);
+    await publishSweep(ctx, companyId, `job:${job.jobKey}:${job.trigger}`);
   });
 }
 

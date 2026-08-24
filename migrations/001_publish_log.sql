@@ -1,8 +1,8 @@
 -- Content calendar plugin, initial schema.
 --
--- Namespace: plugin_content_calendar_cc002f61cd
+-- Namespace: plugin_content_calendar_f2583e060b
 -- Derived by the host as plugin_<slug>_<sha256(pluginId)[0:10]> from
--- pluginId "untrace.plugin-content-calendar" plus namespaceSlug
+-- pluginId "epic0x.plugin-content-calendar" plus namespaceSlug
 -- "content_calendar". Do not hand-edit the hash. If it disagrees with what
 -- derivePluginDatabaseNamespace() computes, every statement here is rejected
 -- as out-of-namespace. scripts/verify-namespace.mjs checks this in CI.
@@ -34,7 +34,7 @@
 -- the authenticated HTTP API. Only company_id is referenced below.
 
 -- One row per publish attempt. Never updated in place, never deleted.
-CREATE TABLE plugin_content_calendar_cc002f61cd.publish_attempts (
+CREATE TABLE plugin_content_calendar_f2583e060b.publish_attempts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id UUID NOT NULL REFERENCES public.companies(id) ON DELETE CASCADE,
 
@@ -79,23 +79,23 @@ CREATE TABLE plugin_content_calendar_cc002f61cd.publish_attempts (
 );
 
 CREATE INDEX publish_attempts_case_idx
-  ON plugin_content_calendar_cc002f61cd.publish_attempts (case_id, attempted_at DESC);
+  ON plugin_content_calendar_f2583e060b.publish_attempts (case_id, attempted_at DESC);
 
 CREATE INDEX publish_attempts_outcome_idx
-  ON plugin_content_calendar_cc002f61cd.publish_attempts (company_id, outcome, attempted_at DESC);
+  ON plugin_content_calendar_f2583e060b.publish_attempts (company_id, outcome, attempted_at DESC);
 
 -- THE DOUBLE-POST INTERLOCK, enforced by the database rather than by the job.
 -- A case may accumulate many skipped or failed attempts but at most one sent.
 -- The scheduler can run late, twice, or concurrently on two workers and still
 -- cannot double-post, because the second insert violates this index.
 CREATE UNIQUE INDEX publish_attempts_one_send_per_case
-  ON plugin_content_calendar_cc002f61cd.publish_attempts (case_id)
+  ON plugin_content_calendar_f2583e060b.publish_attempts (case_id)
   WHERE outcome = 'sent';
 
 -- Operator schedule changes made from the calendar UI. Recorded here first,
 -- then written back to the publish_at field on the case, so a failed
 -- write-back is visible rather than lost.
-CREATE TABLE plugin_content_calendar_cc002f61cd.schedule_overrides (
+CREATE TABLE plugin_content_calendar_f2583e060b.schedule_overrides (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id UUID NOT NULL REFERENCES public.companies(id) ON DELETE CASCADE,
   case_id UUID NOT NULL,
@@ -110,4 +110,4 @@ CREATE TABLE plugin_content_calendar_cc002f61cd.schedule_overrides (
 );
 
 CREATE INDEX schedule_overrides_case_idx
-  ON plugin_content_calendar_cc002f61cd.schedule_overrides (case_id, created_at DESC);
+  ON plugin_content_calendar_f2583e060b.schedule_overrides (case_id, created_at DESC);
