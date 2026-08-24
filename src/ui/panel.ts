@@ -1,13 +1,16 @@
 /**
- * The detail panel's two pure decisions.
+ * The calendar UI's pure decisions.
  *
- * Kept out of the component because both are rules, not rendering, and both
- * were previously wrong in ways that only showed up in front of an operator:
- * a panel that kept displaying the case as it was at click time, and a single
- * shared result area that swallowed status errors on published posts.
+ * Kept out of the components because they are rules, not rendering, and each
+ * was previously wrong in a way that only showed up in front of an operator:
+ * a panel that kept displaying the case as it was at click time, a single
+ * shared result area that swallowed status errors on published posts, and a
+ * month grid that ignored the attached image entirely.
  *
- * No React, no DOM, no imports — so they are unit-tested directly.
+ * No React and no DOM — so they are unit-tested directly.
  */
+
+import { assetContentPath, parseAssetRef } from "../attachments.js";
 
 /** The minimum the panel needs to identify a card; the real entry is wider. */
 export interface Identified {
@@ -53,6 +56,59 @@ export function reconcileSelection<T extends Identified>(
     if (entry?.id === selected.id) return entry;
   }
   return selected;
+}
+
+// ---------------------------------------------------------------------------
+// The image a calendar card shows
+// ---------------------------------------------------------------------------
+
+/** The fields of a calendar entry this rule reads. The real entry is wider. */
+export interface ChipMedia {
+  mediaFile?: string | null;
+  altText?: string | null;
+  title?: string | null;
+}
+
+export interface ChipThumbnail {
+  /** Same-origin, session-authenticated asset content path. */
+  src: string;
+  /** Never empty: a card's image has to say something to a screen reader. */
+  alt: string;
+}
+
+function text(value: string | null | undefined): string {
+  return (value ?? "").trim();
+}
+
+/**
+ * What, if anything, a month-grid card renders as its image.
+ *
+ * NO EXTRA READ. `media_file` is already on every calendar entry, and an asset
+ * reference is enough on its own to name the content endpoint — so the card
+ * needs the bytes and nothing else. Attachment metadata (filename, size, type)
+ * only exists on GET /api/cases/:id, which is why the detail panel fetches it
+ * and the grid must not: that would be one round trip per card, per render.
+ *
+ * Returns null unless `media_file` is a native asset reference. A legacy host
+ * path or bare filename is a real, publishable value, but it is not something
+ * the browser can load — pointing an <img> at it renders a broken-image icon
+ * on the card and says nothing true. Null means the card simply shows no
+ * image, which is what it did before this existed.
+ */
+export function chipThumbnail(entry: ChipMedia | null | undefined): ChipThumbnail | null {
+  const assetId = parseAssetRef(entry?.mediaFile);
+  if (!assetId) return null;
+
+  const alt = text(entry?.altText);
+  if (alt) return { src: assetContentPath(assetId), alt };
+
+  // No alt on the case yet — the panel already nags about that. The card still
+  // has to name the thing, so it borrows the post's own title.
+  const title = text(entry?.title);
+  return {
+    src: assetContentPath(assetId),
+    alt: title ? `Image for ${title}` : "Attached image with no alt text",
+  };
 }
 
 // ---------------------------------------------------------------------------

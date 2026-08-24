@@ -9,6 +9,7 @@ import { uploadCaseImage } from "./upload.js";
 import {
   actionFailure,
   actionSuccess,
+  chipThumbnail,
   publishMessage,
   reconcileSelection,
   statusMessage,
@@ -208,6 +209,11 @@ function Stat({ label, value, tone }: { label: string; value: number; tone?: str
  * put those controls outside as clickable items in the calendar — only keep it
  * inside."). A grid of small buttons is where a mis-click publishes something.
  * The chip shows state; the panel changes it.
+ *
+ * The thumbnail is part of that state, and it is free: `media_file` already
+ * arrives with every calendar entry, so the card renders the asset's bytes
+ * directly and never reads case detail — see `chipThumbnail`. It stays inside
+ * the one button, so the whole card remains a single safe target.
  */
 function EntryChip({
   entry,
@@ -217,6 +223,10 @@ function EntryChip({
   onSelect: (e: CalendarEntry) => void;
 }) {
   const s = STATUS_STYLE[entry.status] ?? STATUS_STYLE.draft;
+  const thumb = chipThumbnail(entry);
+  // Keyed on the src, so re-pointing media_file at a working asset gets another
+  // attempt rather than inheriting the previous image's failure.
+  const [brokenThumb, setBrokenThumb] = useState<string | null>(null);
   return (
     <button
       type="button"
@@ -254,6 +264,24 @@ function EntryChip({
       <span style={{ color: "#a1a1aa", fontVariantNumeric: "tabular-nums" }}>
         {timeOf(entry.publishAt)}
       </span>
+      {/* A card with no loadable image shows none — never a broken-image icon. */}
+      {thumb && brokenThumb !== thumb.src && (
+        <img
+          src={thumb.src}
+          alt={thumb.alt}
+          loading="lazy"
+          decoding="async"
+          onError={() => setBrokenThumb(thumb.src)}
+          style={{
+            width: 18,
+            height: 18,
+            borderRadius: 2,
+            objectFit: "cover",
+            flexShrink: 0,
+            background: "#18181b",
+          }}
+        />
+      )}
       <span
         style={{
           overflow: "hidden",
