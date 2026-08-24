@@ -1,4 +1,8 @@
 node_modules/
 dist/
+out/
+paperclip-content-calendar.tar.gz
 *.tsbuildinfo
 .env
+__pycache__/
+*.pyc

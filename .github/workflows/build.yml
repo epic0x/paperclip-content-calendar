@@ -1,0 +1,117 @@
+name: build
+
+# Builds run HERE, never on the agent hosts.
+# Both droplets are ~1-2 GB RAM with <5 GB free disk; a single `npm install`
+# has previously OOM'd the gateway. The installable artifact is produced in CI
+# and downloaded as a tarball.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests (gate, time, attachments, cases, media, publisher, upload, panel)
+        run: npm test
+
+      - name: Publisher unit tests (X chunked video upload, no network)
+        # The X media state machine — INIT/APPEND/FINALIZE/STATUS — lives in
+        # scripts/x-post.py and cannot be reached from `node --test`. Its
+        # transport is injected, so this runs offline. A publisher that only
+        # breaks in production is the failure this gate exists to prevent.
+        run: python3 -m unittest discover -s test -p "test_x_*.py" -v
+
+      - name: Verify build output
+        run: |
+          set -eu
+          for f in dist/manifest.js dist/worker.js dist/ui/index.js dist/gate.js \
+                   dist/time.js dist/attachments.js dist/cases.js dist/media.js \
+                   dist/publisher.js dist/schedule.js dist/ui/upload.js dist/ui/panel.js; do
+            test -s "$f" || { echo "MISSING OR EMPTY: $f"; exit 1; }
+            echo "ok: $f ($(wc -c < "$f") bytes)"
+          done
+          test -s migrations/001_publish_log.sql
+
+      - name: Verify the publisher scripts are present
+        # The worker spawns these from INSIDE the installed artifact
+        # (src/publisher.ts). An artifact without them installs cleanly and
+        # then reports the X channel as unconfigured at publish time.
+        run: |
+          set -eu
+          for f in scripts/x_publish.py scripts/x-post.py; do
+            test -s "$f" || { echo "MISSING OR EMPTY: $f"; exit 1; }
+            python3 -m py_compile "$f"
+            echo "ok: $f ($(wc -c < "$f") bytes)"
+          done
+
+      - name: Verify the worker resolves with NO node_modules
+        # `paperclipai plugin install` copies built output only — the installed
+        # plugin directory has no node_modules. Anything left external at
+        # bundle time therefore dies at worker startup with ERR_MODULE_NOT_FOUND
+        # and aborts the install. This reproduces that exact condition: copy
+        # dist/ somewhere clean and import it.
+        #
+        # react/react-dom are legitimately host-provided and are the only
+        # permitted externals.
+        run: |
+          set -eu
+          rm -rf /tmp/isolated && mkdir -p /tmp/isolated
+          cp -r dist /tmp/isolated/
+          cd /tmp/isolated
+          echo '{"type":"module"}' > package.json
+          bare=$(grep -oE 'from"[^"./][^"]*"' dist/worker.js | sed 's/from"//;s/"$//' | sort -u || true)
+          echo "bare imports in worker bundle: ${bare:-none}"
+          for m in $bare; do
+            case "$m" in
+              react|react-dom|react/*|node:*) ;;
+              *) echo "FAIL: worker bundle expects '$m' at runtime, but the installed plugin has no node_modules."; exit 1 ;;
+            esac
+          done
+          node --input-type=module -e 'await import("/tmp/isolated/dist/manifest.js"); console.log("manifest.js imports cleanly with no node_modules");'
+
+      - name: Verify the migration namespace matches the derived one
+        # The host derives plugin_<slug>_<sha256(pluginId)[0:10]>. If the
+        # migration SQL hardcodes a different schema, every statement is
+        # rejected at install time. Catch that here, not on the server.
+        run: node scripts/verify-namespace.mjs
+
+      - name: Package installable artifact
+        # `scripts/` ships WITH dist/: the worker resolves the X publisher as
+        # ../scripts/x_publish.py relative to itself, and x_publish.py then
+        # spawns its own sibling x-post.py. Leaving them out makes an artifact
+        # that installs and cannot publish.
+        run: |
+          set -eu
+          mkdir -p out/paperclip-content-calendar
+          cp -r dist migrations scripts package.json README.md out/paperclip-content-calendar/
+          rm -rf out/paperclip-content-calendar/scripts/__pycache__
+          test -s out/paperclip-content-calendar/scripts/x_publish.py
+          test -s out/paperclip-content-calendar/scripts/x-post.py
+          tar -czf paperclip-content-calendar.tar.gz -C out paperclip-content-calendar
+          echo "artifact: $(wc -c < paperclip-content-calendar.tar.gz) bytes"
+          tar -tzf paperclip-content-calendar.tar.gz | grep scripts/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paperclip-content-calendar
+          path: paperclip-content-calendar.tar.gz
+          retention-days: 30

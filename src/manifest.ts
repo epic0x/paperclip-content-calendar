@@ -1,166 +1,177 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
-export const PLUGIN_ID = "paperclipai.plugin-content-calendar";
-export const PLUGIN_VERSION = "0.1.0";
-
-export const CONTENT_PROJECT_KEY = "content-calendar";
-export const CONTENT_MANAGER_AGENT_KEY = "content-manager";
-export const DAILY_POST_ROUTINE_KEY = "daily-post-check";
+/**
+ * Plugin identity.
+ *
+ * The host derives this plugin's Postgres schema as
+ *   plugin_<namespaceSlug>_<sha256(PLUGIN_ID).slice(0,10)>
+ * which for these two values is
+ *   plugin_content_calendar_cc002f61cd
+ * and that literal name is hard-coded in migrations/001_publish_log.sql.
+ * Changing PLUGIN_ID or NAMESPACE_SLUG changes the hash and breaks every
+ * migration statement. If you must change them, recompute the namespace first.
+ */
+export const PLUGIN_ID = "untrace.plugin-content-calendar";
+export const PLUGIN_VERSION = "0.4.0";
+/** This private deployment serves the single Untrace Network company. */
+export const UNTRACE_COMPANY_ID = "b276d33f-a226-4fd1-95fa-b3f3114ccd9d";
+export const NAMESPACE_SLUG = "content_calendar";
+export const DB_NAMESPACE = "plugin_content_calendar_cc002f61cd";
 
 export const PAGE_SLOT_ID = "content-calendar-page";
 export const PAGE_EXPORT_NAME = "ContentCalendarPage";
 export const SIDEBAR_SLOT_ID = "content-calendar-sidebar";
 export const SIDEBAR_EXPORT_NAME = "ContentCalendarSidebar";
-export const DASHBOARD_WIDGET_SLOT_ID = "content-calendar-dashboard-widget";
-export const DASHBOARD_WIDGET_EXPORT_NAME = "ContentCalendarDashboardWidget";
+export const WIDGET_SLOT_ID = "content-calendar-widget";
+export const WIDGET_EXPORT_NAME = "ContentCalendarWidget";
 
-export const JOB_KEY_DAILY_POST_CHECK = "daily-post-check";
+export const JOB_PUBLISH_DUE = "publish-due-cases";
 
-const DAILY_POST_DESCRIPTION = `Check for approved posts scheduled for today and post them to X (Twitter).
+/** Case type this plugin schedules. */
+export const CASE_TYPE = "social_post";
 
-Run procedure:
-1. Query the content calendar for posts with status='approved' AND scheduled_date=CURRENT_DATE.
-2. For each approved post, execute the x-post script with the post content.
-3. On success: update status to 'posted', record the post URL and timestamp.
-4. On failure: update status to 'failed', record the error message.
-5. Report results in the routine issue.`;
+/**
+ * The only case field this plugin depends on that Paperclip does not model
+ * natively. Approval is read from the native `cases.status === "approved"`,
+ * NOT from a JSON field.
+ */
+export const FIELD_PUBLISH_AT = "publish_at";
+export const FIELD_CHANNEL = "channel";
+export const FIELD_CAPTION = "caption";
+export const FIELD_PUBLISH_URL = "publish_url";
+export const FIELD_MEDIA = "media_file";
+/**
+ * The content type of what `media_file` points at, e.g. `video/mp4`.
+ *
+ * Written by `set-media` from the asset Paperclip actually stored, never from
+ * the browser's claim about the file it picked. It exists because `media_file`
+ * is an opaque `asset:<uuid>` — the calendar grid has no attachment metadata
+ * (that lives only on GET /api/cases/:id) and would otherwise have to read one
+ * case per card to know whether to render an <img> or a <video>.
+ *
+ * ABSENT MEANS IMAGE. Every case written before this field existed carries an
+ * image, so its absence is not "unknown", it is the answer.
+ */
+export const FIELD_MEDIA_TYPE = "media_type";
+/** Accessibility text for the attached media. X requires alt on every image. */
+export const FIELD_ALT = "alt_text";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
   apiVersion: 1,
   version: PLUGIN_VERSION,
   displayName: "Content Calendar",
-  description: "Social media content calendar for scheduling and auto-posting to X (Twitter). Generate batches of posts, approve them, and let the daily job handle publishing.",
-  author: "Paperclip",
+  description:
+    "Month calendar for social_post cases plus a publish job. Cases stay the source of truth: this plugin reads them, lays them out by publish_at, and records what it published. It does not author or duplicate content.",
+  author: "Untrace Network",
   categories: ["automation", "ui"],
+
   capabilities: [
+    // Read-only context
     "companies.read",
     "projects.read",
-    "projects.managed",
-    "issues.read",
-    "issues.create",
-    "issues.update",
-    "agents.read",
-    "agents.managed",
-    "routines.managed",
-    "events.subscribe",
-    "jobs.schedule",
+    // Own schema: publish log + schedule overrides
     "database.namespace.migrate",
     "database.namespace.read",
     "database.namespace.write",
-    "activity.log.write",
-    "metrics.write",
+    // Publish job
+    "jobs.schedule",
+    // Reaching the Paperclip Cases API and the channel adapter
     "http.outbound",
-    "ui.sidebar.register",
+    // Board API key + channel tokens come from operator config as secret refs
+    "secrets.read-ref",
+    // Audit trail in the Paperclip activity log
+    "activity.log.write",
+    // UI surfaces
     "ui.page.register",
+    "ui.sidebar.register",
     "ui.dashboardWidget.register",
+    "ui.action.register",
   ],
+
   entrypoints: {
     worker: "./dist/worker.js",
     ui: "./dist/ui",
   },
+
   database: {
-    namespaceSlug: "content_calendar",
+    namespaceSlug: NAMESPACE_SLUG,
     migrationsDir: "migrations",
-    coreReadTables: ["companies", "issues", "projects"],
+    // NOTE: `cases` is deliberately absent — it is not in the host's
+    // PLUGIN_DATABASE_CORE_READ_TABLES whitelist, so it cannot be read from
+    // plugin SQL at all. Case reads go over the authenticated HTTP API.
+    coreReadTables: ["companies", "projects"],
   },
-  projects: [
-    {
-      projectKey: CONTENT_PROJECT_KEY,
-      displayName: "Content Calendar",
-      description: "Plugin-managed project for content calendar posts and scheduling.",
-      status: "in_progress",
-      color: "#7c3aed",
-    },
-  ],
-  agents: [
-    {
-      agentKey: CONTENT_MANAGER_AGENT_KEY,
-      displayName: "Content Manager",
-      role: "content-creator",
-      title: "Social Media Content Manager",
-      icon: "pencil",
-      capabilities: "Generates social media posts, schedules content, and manages the content calendar.",
-      adapterType: "claude_local",
-      adapterPreference: ["claude_local", "codex_local", "gemini_local"],
-      adapterConfig: {
-        dangerouslySkipPermissions: false,
-        dangerouslyBypassApprovalsAndSandbox: false,
-        sandbox: true,
+
+  instanceConfigSchema: {
+    type: "object",
+    required: ["apiBaseUrl"],
+    properties: {
+      apiBaseUrl: {
+        type: "string",
+        title: "Paperclip API base URL",
+        description:
+          "Where the plugin reaches the Cases API. Use the loopback origin on the host, e.g. http://127.0.0.1:3100",
+        default: "http://127.0.0.1:3100",
       },
-      status: "paused",
-      budgetMonthlyCents: 0,
-      instructions: {
-        entryFile: "AGENTS.md",
-        content: `# Content Manager Agent
-
-You are a social media content manager. Your job is to generate engaging, on-brand posts for X (Twitter).
-
-## Responsibilities
-- Generate 10 posts for the next 10 days when requested via the generate-batch action
-- Each post should be under 280 characters
-- Posts should be varied, engaging, and relevant to the company
-- Create corresponding issues in the Content Calendar project for tracking
-
-## Post Generation Guidelines
-- Keep posts under 280 characters
-- Use a mix of informational, promotional, and engaging content
-- Include relevant hashtags where appropriate
-- Vary the tone: professional, casual, educational
-- Space posts evenly across the 10-day window
-
-## Tools Available
-Use plugin tools to create and manage posts in the content calendar database.`,
-        files: {},
+      boardApiKeyRef: {
+        type: "object",
+        title: "Board API key (secret reference)",
+        description:
+          "Secret reference to a board API key created with `paperclipai token board create`. Required to read cases. Without it the calendar renders empty and the publish job reports a configuration error rather than failing silently.",
       },
-    },
-  ],
-  routines: [
-    {
-      routineKey: DAILY_POST_ROUTINE_KEY,
-      title: "Daily Post Check",
-      description: DAILY_POST_DESCRIPTION,
-      status: "paused",
-      priority: "medium",
-      assigneeRef: { resourceKind: "agent", resourceKey: CONTENT_MANAGER_AGENT_KEY },
-      projectRef: { resourceKind: "project", resourceKey: CONTENT_PROJECT_KEY },
-      concurrencyPolicy: "skip_if_active",
-      catchUpPolicy: "skip_missed",
-      triggers: [
-        {
-          kind: "schedule",
-          label: "Daily at 9am UTC",
-          enabled: false,
-          cronExpression: "0 9 * * *",
-          timezone: "UTC",
-          signingMode: null,
-          replayWindowSec: null,
+      paused: {
+        type: "boolean",
+        title: "Pause all publishing (emergency stop)",
+        description:
+          "Normally OFF. Publishing is driven by the posts themselves: approved + a publish_at that has arrived. This is the instance-wide stop for when something is wrong — it halts every route including Post Now, and records what would have gone out as a dry run.",
+        default: false,
+      },
+      channels: {
+        type: "array",
+        title: "Enabled channels",
+        description:
+          "Channel keys the publish job is allowed to send to. A case whose channel is not listed is skipped with a reason.",
+        items: { type: "string" },
+        default: [],
+      },
+      xCredentials: {
+        type: "object",
+        title: "X credentials",
+        description:
+          "Secret references for the X OAuth 1.0a credential set. All four are required to post to X.",
+        properties: {
+          apiKeyRef: { type: "object", title: "API key (secret reference)" },
+          apiSecretRef: { type: "object", title: "API secret (secret reference)" },
+          accessTokenRef: { type: "object", title: "Access token (secret reference)" },
+          accessSecretRef: { type: "object", title: "Access secret (secret reference)" },
         },
-      ],
-      issueTemplate: {
-        surfaceVisibility: "plugin_operation",
-        originId: "routine:daily-post-check",
-        billingCode: "plugin-content-calendar:posting",
+      },
+      lookbackHours: {
+        type: "number",
+        title: "Catch-up window (hours)",
+        description:
+          "How far back the publish job will still pick up a missed case. Beyond this it is skipped as stale rather than posted late.",
+        default: 6,
       },
     },
-  ],
+  },
+
   jobs: [
     {
-      jobKey: JOB_KEY_DAILY_POST_CHECK,
-      displayName: "Daily Post Check",
-      description: "Checks for approved posts scheduled for today and posts them to X.",
-      schedule: "0 9 * * *",
+      jobKey: JOB_PUBLISH_DUE,
+      displayName: "Publish due cases",
+      description:
+        "At :00 and :30: find approved social_post cases whose publish_at is due and not yet published, then publish them. Approved plus due is the whole rule; the emergency pause records a dry run instead of sending.",
+      // Dubai has a fixed UTC+4 offset, so :00/:30 Dubai aligns with :00/:30
+      // UTC. Restricting UI and server writes to those slots lets this bounded,
+      // non-LLM job run twice an hour with no timing drift.
+      schedule: "0,30 * * * *",
     },
   ],
+
   ui: {
     slots: [
-      {
-        type: "sidebar",
-        id: SIDEBAR_SLOT_ID,
-        displayName: "Content Calendar",
-        exportName: SIDEBAR_EXPORT_NAME,
-        order: 40,
-      },
       {
         type: "page",
         id: PAGE_SLOT_ID,
@@ -169,10 +180,17 @@ Use plugin tools to create and manage posts in the content calendar database.`,
         routePath: "content-calendar",
       },
       {
-        type: "dashboardWidget",
-        id: DASHBOARD_WIDGET_SLOT_ID,
+        type: "sidebar",
+        id: SIDEBAR_SLOT_ID,
         displayName: "Content Calendar",
-        exportName: DASHBOARD_WIDGET_EXPORT_NAME,
+        exportName: SIDEBAR_EXPORT_NAME,
+        order: 40,
+      },
+      {
+        type: "dashboardWidget",
+        id: WIDGET_SLOT_ID,
+        displayName: "Upcoming posts",
+        exportName: WIDGET_EXPORT_NAME,
       },
     ],
   },
