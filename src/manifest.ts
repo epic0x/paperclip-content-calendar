@@ -12,7 +12,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
  * migration statement. If you must change them, recompute the namespace first.
  */
 export const PLUGIN_ID = "untrace.plugin-content-calendar";
-export const PLUGIN_VERSION = "0.3.1";
+export const PLUGIN_VERSION = "0.4.0";
 /** This private deployment serves the single Untrace Network company. */
 export const UNTRACE_COMPANY_ID = "b276d33f-a226-4fd1-95fa-b3f3114ccd9d";
 export const NAMESPACE_SLUG = "content_calendar";
@@ -40,7 +40,20 @@ export const FIELD_CHANNEL = "channel";
 export const FIELD_CAPTION = "caption";
 export const FIELD_PUBLISH_URL = "publish_url";
 export const FIELD_MEDIA = "media_file";
-/** Accessibility text for the attached image. X requires alt on every image. */
+/**
+ * The content type of what `media_file` points at, e.g. `video/mp4`.
+ *
+ * Written by `set-media` from the asset Paperclip actually stored, never from
+ * the browser's claim about the file it picked. It exists because `media_file`
+ * is an opaque `asset:<uuid>` — the calendar grid has no attachment metadata
+ * (that lives only on GET /api/cases/:id) and would otherwise have to read one
+ * case per card to know whether to render an <img> or a <video>.
+ *
+ * ABSENT MEANS IMAGE. Every case written before this field existed carries an
+ * image, so its absence is not "unknown", it is the answer.
+ */
+export const FIELD_MEDIA_TYPE = "media_type";
+/** Accessibility text for the attached media. X requires alt on every image. */
 export const FIELD_ALT = "alt_text";
 
 const manifest: PaperclipPluginManifestV1 = {

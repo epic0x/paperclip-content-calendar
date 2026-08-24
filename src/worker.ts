@@ -3,6 +3,7 @@ import { writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { dubaiDayKey, isHalfHourSlot } from "./time.js";
+import { firstFreeSlot, isDayKey } from "./schedule.js";
 import {
   definePlugin,
   runWorker,
@@ -19,13 +20,17 @@ import {
   CasesNotConfiguredError,
   PANEL_STATUSES,
   assertAttachedAsset,
+  assertPublishableMedia,
   buildContentPatch,
+  buildCreatePayload,
   buildMediaPatch,
+  createSocialCase,
   describeSetMediaFailure,
   downloadAsset,
   fetchCaseDetail,
   isPanelStatus,
   listSocialCases,
+  newCaseKey,
   patchCaseFields,
   readConfig,
   type CalendarConfig,
@@ -34,6 +39,8 @@ import {
 } from "./cases.js";
 import {
   ALLOWED_IMAGE_TYPES,
+  ALLOWED_MEDIA_TYPES,
+  ALLOWED_VIDEO_TYPES,
   DEFAULT_MAX_UPLOAD_BYTES,
 } from "./attachments.js";
 import { resolveMediaForPublish, type ResolvedMedia } from "./media.js";
@@ -289,9 +296,15 @@ async function registerDataHandlers(ctx: PluginContext): Promise<void> {
     const caseId = requireStr(params.caseId, "caseId");
     const cfg = await readConfig(ctx, companyId);
 
+    // The panel builds its file picker's `accept` from these, so the list the
+    // operator can choose from is the same list the upload check enforces.
+    // `allowedImageTypes` stays for older UI bundles that only knew about
+    // images; a stale bundle then keeps working, minus video.
     const limits = {
       maxUploadBytes: await uploadLimitBytes(ctx, companyId),
       allowedImageTypes: [...ALLOWED_IMAGE_TYPES],
+      allowedVideoTypes: [...ALLOWED_VIDEO_TYPES],
+      allowedMediaTypes: [...ALLOWED_MEDIA_TYPES],
     };
 
     try {
@@ -367,6 +380,86 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
       );
       throw err;
     }
+  });
+
+  /**
+   * create-post — author a new social_post case from the calendar.
+   *
+   * The form asks for a title, an optional caption and a DATE. Everything that
+   * has to be trusted happens here, holding the board API key the browser does
+   * not have:
+   *
+   *  1. THE SLOT IS CHOSEN SERVER-SIDE. `listSocialCases` is re-read at create
+   *     time and the slot is picked from that, not from the month the browser
+   *     happens to be showing. A stale calendar, an active channel filter, or a
+   *     second operator creating on the same day would each hand out an 09:00
+   *     that is already taken.
+   *
+   *  2. THE KEY IS MINTED HERE. `POST /cases` upserts on `(caseType, key)` and
+   *     matches `isNull(cases.key)` when no key is sent — so a keyless create
+   *     silently OVERWRITES an existing keyless case. See `buildCreatePayload`.
+   *
+   *  3. IT CREATES A DRAFT AND NOTHING MORE. A date and a title, optionally a
+   *     caption. No channel, no publish_url, and the native status is `draft`,
+   *     so the publish gate refuses it by every route until a human opens it,
+   *     fills in the rest and approves. Scheduling is not approving.
+   */
+  ctx.actions.register("create-post", async (params, actionContext) => {
+    const companyId = requireStr(params.companyId, "companyId");
+    const title = requireStr(params.title, "title");
+    const date = requireStr(params.date, "date");
+    const caption = typeof params.caption === "string" ? params.caption : null;
+
+    if (!isDayKey(date)) {
+      throw new Error(`date must be a Dubai calendar date (YYYY-MM-DD), got ${date}`);
+    }
+
+    const cfg = await readConfig(ctx, companyId);
+    const existing = await listSocialCases(ctx, cfg, companyId);
+
+    const publishAt = firstFreeSlot(date, existing.map((e) => e.publishAt));
+    if (!publishAt) {
+      throw new Error(
+        `${date} is full — every half-hour slot on it already has a post. Nothing was created.`,
+      );
+    }
+
+    const { created, entry } = await createSocialCase(
+      ctx,
+      cfg,
+      buildCreatePayload({ title, caption, publishAt, key: newCaseKey() }),
+      companyId,
+    );
+
+    if (!created) {
+      // A freshly minted key cannot collide, so a 200 here means the server
+      // matched something else entirely. Say so rather than reporting a create.
+      ctx.logger.warn(
+        `[content-calendar] create-post for "${title}" answered 200 (upsert) rather than 201; it updated ${entry.identifier}`,
+      );
+    }
+
+    await ctx.activity.log({
+      companyId,
+      message: `Case ${entry.identifier} created as a draft from the content calendar for ${date}`,
+      entityType: "case",
+      entityId: entry.id,
+      metadata: {
+        publishAt,
+        date,
+        created,
+        actor: actionContext?.actor?.userId ?? "calendar-ui",
+      },
+    });
+
+    return {
+      ok: true,
+      created,
+      id: entry.id,
+      identifier: entry.identifier,
+      publishAt: entry.publishAt ?? publishAt,
+      entry,
+    };
   });
 
   /**
@@ -502,22 +595,37 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
     // then closed; without this, a repointing that failed leaves nothing on the
     // server saying what was being pointed where. The error is rethrown
     // unchanged, so the action's behaviour is exactly as it was.
-    const { detail, attachment, updated } = await (async () => {
+    const { detail, attachment, kind, updated } = await (async () => {
       const found = await fetchCaseDetail(ctx, cfg, identifier, companyId);
       const linked = assertAttachedAsset(found, assetId);
+      // Attached is not the same as publishable. Paperclip accepts types this
+      // calendar neither renders nor sends (video/webm), and recording one
+      // leaves a post that looks attached until the moment it is due. Refused
+      // BEFORE the patch, so media_file still points at whatever worked.
+      const linkedKind = assertPublishableMedia(linked, identifier);
       const patched = await patchCaseFields(
         ctx,
         cfg,
         identifier,
         buildMediaPatch({
           assetId,
+          // The type PAPERCLIP recorded for the stored asset, read back from
+          // the case that was just verified to carry it — never the browser's
+          // claim about the file it picked. A caller cannot make a post render
+          // and publish as a video by saying so in the action params.
+          contentType: linked.contentType,
           altText:
             typeof params.altText === "string" ? params.altText : undefined,
         }),
         undefined,
         companyId,
       );
-      return { detail: found, attachment: linked, updated: patched };
+      return {
+        detail: found,
+        attachment: linked,
+        kind: linkedKind,
+        updated: patched,
+      };
     })().catch((err: unknown) => {
       ctx.logger.error(
         describeSetMediaFailure({ identifier, assetId, companyId, err }),
@@ -527,7 +635,7 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
 
     await ctx.activity.log({
       companyId,
-      message: `Case ${identifier} image replaced from the content calendar (asset ${assetId})`,
+      message: `Case ${identifier} ${kind} replaced from the content calendar (asset ${assetId})`,
       entityType: "case",
       entityId: updated.id,
       metadata: {
@@ -536,6 +644,7 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
         contentType: attachment.contentType,
         byteSize: attachment.byteSize,
         previousMediaFile: detail.mediaFile,
+        previousMediaType: detail.mediaType,
         actor: actionContext?.actor?.userId ?? "calendar-ui",
       },
     });
@@ -545,7 +654,9 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
       identifier,
       assetId,
       contentPath: attachment.contentPath,
+      contentType: attachment.contentType,
       mediaFile: (updated.fields?.media_file as string | null) ?? null,
+      mediaType: (updated.fields?.media_type as string | null) ?? null,
     };
   });
 

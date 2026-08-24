@@ -18,7 +18,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { uploadCaseImage } from "../dist/ui/upload.js";
+import { uploadCaseImage, uploadCaseMedia } from "../dist/ui/upload.js";
 
 const ASSET_ID = "8f14e45f-ceea-467a-9c1e-3a0a1b2c3d4e";
 
@@ -74,6 +74,90 @@ test("the image is posted to the case's native attachment endpoint as multipart"
     byteSize: 2048,
     originalFilename: "hero.png",
   });
+});
+
+// --- video goes over the SAME native endpoint ------------------------------
+//
+// There is no second upload path for video: `POST /api/cases/:id/attachments`
+// stores the bytes and links them, exactly as it does for an image, and the
+// asset's content type is what tells everything downstream which one it was.
+
+test("a video is posted to the same case attachment endpoint, as multipart", async () => {
+  const calls = [];
+  const result = await uploadCaseMedia({
+    caseId: "case-uuid",
+    file: new File([new Uint8Array(4096)], "launch.mp4", { type: "video/mp4" }),
+    maxBytes: 10 * 1024 * 1024,
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init });
+      return new Response(
+        JSON.stringify({
+          id: "attachment-uuid",
+          asset: {
+            id: ASSET_ID,
+            contentType: "video/mp4",
+            byteSize: 4096,
+            originalFilename: "launch.mp4",
+          },
+        }),
+        { status: 201, headers: { "Content-Type": "application/json" } },
+      );
+    },
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "/api/cases/case-uuid/attachments");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.credentials, "include");
+  assert.ok(calls[0].init.body instanceof FormData);
+  assert.equal(calls[0].init.body.get("file").name, "launch.mp4");
+  assert.equal(
+    calls[0].init.headers?.["Content-Type"],
+    undefined,
+    "the browser must set the multipart boundary itself",
+  );
+
+  assert.deepEqual(result, {
+    attachmentId: "attachment-uuid",
+    assetId: ASSET_ID,
+    contentPath: `/api/assets/${ASSET_ID}/content`,
+    contentType: "video/mp4",
+    byteSize: 4096,
+    originalFilename: "launch.mp4",
+  });
+});
+
+test("a video type X cannot reliably take never reaches the network", async () => {
+  let called = false;
+  await assert.rejects(
+    () =>
+      uploadCaseMedia({
+        caseId: "case-uuid",
+        file: new File([new Uint8Array(64)], "clip.webm", { type: "video/webm" }),
+        maxBytes: 10 * 1024 * 1024,
+        fetchImpl: async () => {
+          called = true;
+          return new Response("{}", { status: 201 });
+        },
+      }),
+    /video\/webm/,
+  );
+  assert.equal(called, false);
+});
+
+test("an image still uploads through the general media path", async () => {
+  const result = await uploadCaseMedia({
+    caseId: "case-uuid",
+    file: pngFile(),
+    maxBytes: 10 * 1024 * 1024,
+    fetchImpl: async () =>
+      new Response(JSON.stringify(created()), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      }),
+  });
+  assert.equal(result.contentType, "image/png");
+  assert.equal(result.assetId, ASSET_ID);
 });
 
 test("a rejected upload surfaces the server's reason — never a silent success", async () => {

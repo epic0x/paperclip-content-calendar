@@ -30,19 +30,38 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Unit tests (gate, time, attachments, cases, media, upload)
+      - name: Unit tests (gate, time, attachments, cases, media, publisher, upload, panel)
         run: npm test
+
+      - name: Publisher unit tests (X chunked video upload, no network)
+        # The X media state machine — INIT/APPEND/FINALIZE/STATUS — lives in
+        # scripts/x-post.py and cannot be reached from `node --test`. Its
+        # transport is injected, so this runs offline. A publisher that only
+        # breaks in production is the failure this gate exists to prevent.
+        run: python3 -m unittest discover -s test -p "test_x_*.py" -v
 
       - name: Verify build output
         run: |
           set -eu
           for f in dist/manifest.js dist/worker.js dist/ui/index.js dist/gate.js \
                    dist/time.js dist/attachments.js dist/cases.js dist/media.js \
-                   dist/ui/upload.js dist/ui/panel.js; do
+                   dist/publisher.js dist/schedule.js dist/ui/upload.js dist/ui/panel.js; do
             test -s "$f" || { echo "MISSING OR EMPTY: $f"; exit 1; }
             echo "ok: $f ($(wc -c < "$f") bytes)"
           done
           test -s migrations/001_publish_log.sql
+
+      - name: Verify the publisher scripts are present
+        # The worker spawns these from INSIDE the installed artifact
+        # (src/publisher.ts). An artifact without them installs cleanly and
+        # then reports the X channel as unconfigured at publish time.
+        run: |
+          set -eu
+          for f in scripts/x_publish.py scripts/x-post.py; do
+            test -s "$f" || { echo "MISSING OR EMPTY: $f"; exit 1; }
+            python3 -m py_compile "$f"
+            echo "ok: $f ($(wc -c < "$f") bytes)"
+          done
 
       - name: Verify the worker resolves with NO node_modules
         # `paperclipai plugin install` copies built output only — the installed
@@ -76,12 +95,20 @@ jobs:
         run: node scripts/verify-namespace.mjs
 
       - name: Package installable artifact
+        # `scripts/` ships WITH dist/: the worker resolves the X publisher as
+        # ../scripts/x_publish.py relative to itself, and x_publish.py then
+        # spawns its own sibling x-post.py. Leaving them out makes an artifact
+        # that installs and cannot publish.
         run: |
           set -eu
           mkdir -p out/paperclip-content-calendar
-          cp -r dist migrations package.json README.md out/paperclip-content-calendar/
+          cp -r dist migrations scripts package.json README.md out/paperclip-content-calendar/
+          rm -rf out/paperclip-content-calendar/scripts/__pycache__
+          test -s out/paperclip-content-calendar/scripts/x_publish.py
+          test -s out/paperclip-content-calendar/scripts/x-post.py
           tar -czf paperclip-content-calendar.tar.gz -C out paperclip-content-calendar
           echo "artifact: $(wc -c < paperclip-content-calendar.tar.gz) bytes"
+          tar -tzf paperclip-content-calendar.tar.gz | grep scripts/
 
       - uses: actions/upload-artifact@v4
         with:

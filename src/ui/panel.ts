@@ -10,7 +10,12 @@
  * No React and no DOM — so they are unit-tested directly.
  */
 
-import { assetContentPath, parseAssetRef } from "../attachments.js";
+import {
+  assetContentPath,
+  mediaKindOf,
+  parseAssetRef,
+  type MediaKind,
+} from "../attachments.js";
 
 /** The minimum the panel needs to identify a card; the real entry is wider. */
 export interface Identified {
@@ -59,55 +64,173 @@ export function reconcileSelection<T extends Identified>(
 }
 
 // ---------------------------------------------------------------------------
-// The image a calendar card shows
+// The media a calendar card shows
 // ---------------------------------------------------------------------------
 
 /** The fields of a calendar entry this rule reads. The real entry is wider. */
 export interface ChipMedia {
   mediaFile?: string | null;
+  /**
+   * From the case's `media_type`, already classified by the worker.
+   *
+   * Three distinct states, and they are not interchangeable:
+   *   "image" / "video" — render that
+   *   null              — recorded, but a type this plugin does not render
+   *   absent            — a bundle older than media_type, i.e. an image
+   */
+  mediaType?: MediaKind | null;
   altText?: string | null;
   title?: string | null;
 }
 
-export interface ChipThumbnail {
+export interface CardMedia {
+  /** Which element the card renders. Never guessed from the file name. */
+  kind: MediaKind;
   /** Same-origin, session-authenticated asset content path. */
   src: string;
-  /** Never empty: a card's image has to say something to a screen reader. */
+  /** Never empty: a card's media has to say something to a screen reader. */
   alt: string;
 }
+
+/** @deprecated Use {@link CardMedia}. */
+export type ChipThumbnail = CardMedia;
 
 function text(value: string | null | undefined): string {
   return (value ?? "").trim();
 }
 
 /**
- * What, if anything, a month-grid card renders as its image.
+ * What, if anything, a month-grid card renders as its media.
  *
- * NO EXTRA READ. `media_file` is already on every calendar entry, and an asset
- * reference is enough on its own to name the content endpoint — so the card
- * needs the bytes and nothing else. Attachment metadata (filename, size, type)
- * only exists on GET /api/cases/:id, which is why the detail panel fetches it
- * and the grid must not: that would be one round trip per card, per render.
+ * NO EXTRA READ. `media_file` and `media_type` are already on every calendar
+ * entry, and an asset reference is enough on its own to name the content
+ * endpoint — so the card needs the bytes and nothing else. Attachment metadata
+ * (filename, size, type) only exists on GET /api/cases/:id, which is why the
+ * detail panel fetches it and the grid must not: that would be one round trip
+ * per card, per render. Carrying the KIND on the case field is what keeps that
+ * true now that a card has two things it might render.
  *
  * Returns null unless `media_file` is a native asset reference. A legacy host
  * path or bare filename is a real, publishable value, but it is not something
  * the browser can load — pointing an <img> at it renders a broken-image icon
  * on the card and says nothing true. Null means the card simply shows no
- * image, which is what it did before this existed.
+ * media, which is what it did before this existed.
  */
-export function chipThumbnail(entry: ChipMedia | null | undefined): ChipThumbnail | null {
+export function cardMedia(entry: ChipMedia | null | undefined): CardMedia | null {
   const assetId = parseAssetRef(entry?.mediaFile);
   if (!assetId) return null;
 
+  // `undefined` is data from before media_type existed, and that data is an
+  // image. An explicit null is the projection saying "not renderable" — the
+  // card shows nothing rather than a broken element.
+  const kind: MediaKind | null =
+    entry?.mediaType === undefined ? "image" : entry.mediaType;
+  if (!kind) return null;
+
+  const src = assetContentPath(assetId);
   const alt = text(entry?.altText);
-  if (alt) return { src: assetContentPath(assetId), alt };
+  if (alt) return { kind, src, alt };
 
   // No alt on the case yet — the panel already nags about that. The card still
   // has to name the thing, so it borrows the post's own title.
   const title = text(entry?.title);
+  const noun = kind === "video" ? "Video" : "Image";
   return {
-    src: assetContentPath(assetId),
-    alt: title ? `Image for ${title}` : "Attached image with no alt text",
+    kind,
+    src,
+    alt: title
+      ? `${noun} for ${title}`
+      : `Attached ${noun.toLowerCase()} with no alt text`,
+  };
+}
+
+/** @deprecated Use {@link cardMedia}, which also reports the kind. */
+export const chipThumbnail = cardMedia;
+
+// ---------------------------------------------------------------------------
+// Playing video, which only the open panel ever does
+// ---------------------------------------------------------------------------
+
+export interface VideoPlayback {
+  autoPlay: boolean;
+  controls: boolean;
+  muted: boolean;
+  loop: boolean;
+  /** Never "auto": a month of posts must not pull a month of video. */
+  preload: "metadata";
+}
+
+/**
+ * A video in the open panel.
+ *
+ * Still no autoplay — opening a post is not a request to play it — but this is
+ * where the operator checks what is about to go out, so it has real controls
+ * and it is NOT muted: approving a video without being able to hear it is
+ * approving half of it.
+ */
+export const SELECTED_VIDEO_PLAYBACK: VideoPlayback = {
+  autoPlay: false,
+  controls: true,
+  muted: false,
+  loop: false,
+  preload: "metadata",
+};
+
+/** What the panel needs off a case detail. The real detail is wider. */
+export interface SelectedAttachment {
+  assetId: string;
+  contentPath: string;
+  contentType: string;
+  originalFilename?: string | null;
+}
+
+export interface SelectedDetail {
+  altText?: string | null;
+  activeAttachment?: SelectedAttachment | null;
+}
+
+export interface SelectedMedia {
+  kind: MediaKind;
+  /** The attachment's own content path — session-authenticated, same-origin. */
+  src: string;
+  alt: string;
+  /** Video only. Null for an image, which has nothing to play. */
+  playback: VideoPlayback | null;
+}
+
+/**
+ * What the OPEN panel previews.
+ *
+ * THE ATTACHMENT IS THE AUTHORITY. The month grid has to trust the case's
+ * `media_type` field because it has nothing else, but the panel is holding the
+ * attachment record, and `contentType` on it is Paperclip's own account of the
+ * bytes it stored. When the two disagree — a hand-edited case, a `set-media`
+ * that lost a race, an asset replaced underneath — the field is the side that
+ * can be wrong and the asset is the side that will actually be published.
+ *
+ * A type this plugin does not render is null rather than a coerced <img>:
+ * a broken image in the preview says "your media is gone" about a post whose
+ * media is fine.
+ */
+export function selectedMedia(
+  detail: SelectedDetail | null | undefined,
+): SelectedMedia | null {
+  const attachment = detail?.activeAttachment;
+  if (!attachment) return null;
+
+  const kind = mediaKindOf(attachment.contentType);
+  if (!kind) return null;
+
+  const alt =
+    text(detail?.altText) ||
+    text(attachment.originalFilename) ||
+    `Attached ${kind} with no alt text`;
+
+  return {
+    kind,
+    src: attachment.contentPath,
+    alt,
+    playback: kind === "video" ? SELECTED_VIDEO_PLAYBACK : null,
   };
 }
 

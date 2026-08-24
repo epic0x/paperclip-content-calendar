@@ -186,6 +186,60 @@ test("alt text and caption ride along on the detail projection", () => {
   assert.equal(detail.status, "in_review");
 });
 
+// --- what KIND of media a card is looking at -------------------------------
+//
+// The month grid gets calendar entries and nothing else — no attachment
+// metadata, because that only exists on GET /api/cases/:id and reading it per
+// card would be one round trip per post per render. So the case field itself
+// has to say whether media_file is an image or a video.
+
+test("a case carrying a video projects as a video", () => {
+  const detail = toDetail(
+    detailResponse({
+      fields: {
+        media_file: `asset:${ASSET_ID}`,
+        media_type: "video/mp4",
+      },
+    }),
+  );
+  assert.equal(detail.mediaType, "video");
+});
+
+test("an asset attached before media_type existed is still an image", () => {
+  // Every case written by v0.3.x carries an image and no media_type. Absent is
+  // the answer, not a missing one — treating it as unknown would blank the
+  // thumbnail on every post that already works.
+  const detail = toDetail(detailResponse());
+  assert.equal(detail.mediaType, "image");
+});
+
+test("a post with no media has no media type at all", () => {
+  const detail = toDetail(detailResponse({ fields: { caption: "hi" } }));
+  assert.equal(detail.mediaType, null);
+});
+
+test("a stored type this plugin does not render is reported as neither, not guessed as an image", () => {
+  const detail = toDetail(
+    detailResponse({
+      fields: { media_file: `asset:${ASSET_ID}`, media_type: "video/webm" },
+    }),
+  );
+  assert.equal(
+    detail.mediaType,
+    null,
+    "rendering a webm into an <img> would show a broken image and claim it is the post",
+  );
+});
+
+test("the stored type is read case- and whitespace-insensitively", () => {
+  const detail = toDetail(
+    detailResponse({
+      fields: { media_file: `asset:${ASSET_ID}`, media_type: " VIDEO/MP4 " },
+    }),
+  );
+  assert.equal(detail.mediaType, "video");
+});
+
 // --- what a save actually sends -------------------------------------------
 
 test("saving a caption sends only the caption, so nothing else can be clobbered", () => {
@@ -206,10 +260,43 @@ test("clearing a field is deliberate: empty text saves as null, absent keys stay
 });
 
 test("attaching an image points media_file at the native asset, never a host path", () => {
-  assert.deepEqual(buildMediaPatch({ assetId: ASSET_ID, altText: "a chart" }), {
-    media_file: `asset:${ASSET_ID}`,
-    alt_text: "a chart",
-  });
+  assert.deepEqual(
+    buildMediaPatch({
+      assetId: ASSET_ID,
+      contentType: "image/png",
+      altText: "a chart",
+    }),
+    {
+      media_file: `asset:${ASSET_ID}`,
+      media_type: "image/png",
+      alt_text: "a chart",
+    },
+  );
+});
+
+test("attaching a video records WHAT it is, in the same patch that points at it", () => {
+  // media_file and media_type move together or not at all. A media_file left
+  // with a stale media_type beside it is a post that renders as the wrong thing
+  // and publishes down the wrong X upload path.
+  assert.deepEqual(
+    buildMediaPatch({ assetId: ASSET_ID, contentType: "video/mp4" }),
+    {
+      media_file: `asset:${ASSET_ID}`,
+      media_type: "video/mp4",
+    },
+  );
+  assert.deepEqual(
+    buildMediaPatch({ assetId: ASSET_ID, contentType: " VIDEO/QuickTime " }),
+    {
+      media_file: `asset:${ASSET_ID}`,
+      media_type: "video/quicktime",
+    },
+  );
+});
+
+test("replacing a video with an image rewrites media_type rather than leaving it stale", () => {
+  const patch = buildMediaPatch({ assetId: ASSET_ID, contentType: "image/jpeg" });
+  assert.equal(patch.media_type, "image/jpeg");
 });
 
 // --- write-back over the real HTTP path ------------------------------------
@@ -309,7 +396,7 @@ test("a status change writes the NATIVE case status and still preserves fields",
   assert.equal(updated.status, "approved");
 });
 
-test("attaching a new image leaves caption, channel and publish_at alone", async (t) => {
+test("attaching new media leaves caption, channel and publish_at alone, and carries its type", async (t) => {
   const calls = stubFetch(t, (url, init) =>
     init.method === "PATCH"
       ? json({ ...detailResponse(), fields: JSON.parse(init.body).fields })
@@ -321,18 +408,26 @@ test("attaching a new image leaves caption, channel and publish_at alone", async
     CTX,
     CFG,
     "PAP-C1",
-    buildMediaPatch({ assetId: newAsset, altText: "the new chart" }),
+    buildMediaPatch({
+      assetId: newAsset,
+      contentType: "video/mp4",
+      altText: "the new clip",
+    }),
     undefined,
     "company-uuid",
   );
 
+  // Paperclip REPLACES fields wholesale, so media_type has to survive the merge
+  // in the same request that repoints media_file — not a second write that can
+  // fail on its own and leave the two disagreeing.
   const sent = JSON.parse(calls[1].init.body);
   assert.deepEqual(sent.fields, {
     caption: "hello world",
     channel: "x",
     publish_at: "2026-08-24T11:00:00Z",
     media_file: `asset:${newAsset}`,
-    alt_text: "the new chart",
+    media_type: "video/mp4",
+    alt_text: "the new clip",
   });
 });
 
@@ -450,4 +545,21 @@ test("a non-Error failure is still described rather than logged as [object Objec
   assert.match(line, /connection reset/);
   assert.match(line, /PAP-C2/);
   assert.ok(!line.includes("[object Object]"));
+});
+
+test("the persisted media_type is the normalised content type", () => {
+  // media_type is read back by `cardMedia` and by the publish path, both of
+  // which match it exactly. Persisting `video/mp4; charset=binary` verbatim
+  // wrote a value that neither of them recognises, so the card went blank and
+  // the post could not tell an operator why.
+  const patch = buildMediaPatch({
+    assetId: ASSET_ID,
+    contentType: "VIDEO/MP4; charset=binary",
+  });
+  assert.equal(patch.media_type, "video/mp4");
+  assert.equal(patch.media_file, `asset:${ASSET_ID}`);
+  assert.equal(
+    buildMediaPatch({ assetId: ASSET_ID, contentType: "  Image/PNG  " }).media_type,
+    "image/png",
+  );
 });

@@ -28,8 +28,51 @@ export const ALLOWED_IMAGE_TYPES = [
   "image/gif",
 ] as const;
 
+/**
+ * Video types accepted for a social post.
+ *
+ * NARROWER THAN THE HOST ON PURPOSE. Paperclip's own attachment allowlist also
+ * carries `video/webm` and `video/x-m4v`, and the case attachment route checks
+ * no content type at all — so anything rejected here is rejected by us or by
+ * nobody. These two are what X's chunked upload ingests without surprises:
+ * webm is not a documented X input at all, and x-m4v is an Apple container that
+ * X accepts inconsistently. A file that uploads fine to Paperclip and then
+ * fails at X is the worst of both, because the post looks attached until the
+ * moment it is due.
+ */
+export const ALLOWED_VIDEO_TYPES = ["video/mp4", "video/quicktime"] as const;
+
+/** Everything a social post may carry, images first. */
+export const ALLOWED_MEDIA_TYPES = [
+  ...ALLOWED_IMAGE_TYPES,
+  ...ALLOWED_VIDEO_TYPES,
+] as const;
+
 /** Matches MAX_ATTACHMENT_BYTES in server/dist/attachment-types.js. */
 export const DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+/** What a post's media IS — the one distinction the UI and X both care about. */
+export type MediaKind = "image" | "video";
+
+/**
+ * A content type reduced to `type/subtype`, lowercased and trimmed.
+ *
+ * THE ONE PLACE THIS IS DONE. A `Content-Type` is a type plus optional
+ * parameters — `video/mp4; charset=binary` is a real value to find on an asset
+ * row, and some uploaders and proxies always send one. Every consumer used to
+ * `.trim().toLowerCase()` its own copy and then match the whole string
+ * exactly, so one parameter made the same file an empty month card, an
+ * unpreviewable panel and a `.bin` temp file that X rejects: three symptoms,
+ * one cause, three places to fix it.
+ *
+ * The parameter is dropped, never interpreted. Nothing downstream reads
+ * charset or name, and a type is not invented for a value that has none.
+ */
+export function normalizeContentType(
+  contentType: string | null | undefined,
+): string {
+  return (contentType ?? "").split(";")[0].trim().toLowerCase();
+}
 
 export interface UploadCandidate {
   name: string;
@@ -46,19 +89,46 @@ function mib(bytes: number): string {
 }
 
 /**
+ * Classify a content type, by EXACT match against the same allowlists the
+ * upload check uses.
+ *
+ * Deliberately not `startsWith("video/")`. The content type reaches here from
+ * an asset row, a case field and a picked file, and a prefix test would call
+ * `video/webm` a video everywhere in the UI while the upload path refuses it —
+ * two answers to one question. Anything not on a list is null: not an image,
+ * not a video, not renderable.
+ *
+ * Parameters are dropped first (`normalizeContentType`), so an exact match is
+ * a match on what the bytes ARE rather than on how the type happened to be
+ * spelled by whatever stored them.
+ */
+export function mediaKindOf(
+  contentType: string | null | undefined,
+): MediaKind | null {
+  const type = normalizeContentType(contentType);
+  if ((ALLOWED_IMAGE_TYPES as readonly string[]).includes(type)) return "image";
+  if ((ALLOWED_VIDEO_TYPES as readonly string[]).includes(type)) return "video";
+  return null;
+}
+
+/**
  * Decide whether a locally selected file may be sent to Paperclip.
  *
  * Returns a reason rather than throwing, so the panel can show it inline.
+ * `allowed` narrows the accepted set for callers that want one kind only.
  */
-export function validateImageUpload(
+export function validateMediaUpload(
   file: UploadCandidate,
-  opts: { maxBytes: number },
+  opts: { maxBytes: number; allowed?: readonly string[] },
 ): UploadValidation {
-  const type = (file.type ?? "").trim().toLowerCase();
-  if (!(ALLOWED_IMAGE_TYPES as readonly string[]).includes(type)) {
+  const allowed = opts.allowed ?? ALLOWED_MEDIA_TYPES;
+  // Same normalisation as everywhere else: a browser that reports
+  // `video/mp4; codecs=...` is describing a file this does accept.
+  const type = normalizeContentType(file.type);
+  if (!allowed.includes(type)) {
     return {
       ok: false,
-      error: `${type || "unknown file type"} is not an accepted image. Use ${ALLOWED_IMAGE_TYPES.join(", ")}.`,
+      error: `${type || "unknown file type"} is not accepted. Use ${allowed.join(", ")}.`,
     };
   }
   if (!Number.isFinite(file.size) || file.size <= 0) {
@@ -67,10 +137,28 @@ export function validateImageUpload(
   if (file.size > opts.maxBytes) {
     return {
       ok: false,
-      error: `That image is ${mib(file.size)}. This company's limit is ${mib(opts.maxBytes)}.`,
+      error: `That file is ${mib(file.size)}. This company's limit is ${mib(opts.maxBytes)}.`,
     };
   }
   return { ok: true, error: null };
+}
+
+/**
+ * The image-only check.
+ *
+ * Kept as its own function rather than aliased onto `validateMediaUpload`:
+ * an alias would silently start accepting video everywhere the old name is
+ * still used, which is the opposite of what a caller asking for an image
+ * check means.
+ */
+export function validateImageUpload(
+  file: UploadCandidate,
+  opts: { maxBytes: number },
+): UploadValidation {
+  return validateMediaUpload(file, {
+    maxBytes: opts.maxBytes,
+    allowed: ALLOWED_IMAGE_TYPES,
+  });
 }
 
 // ---------------------------------------------------------------------------

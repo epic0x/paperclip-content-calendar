@@ -60,9 +60,11 @@ const nodeModule = (name) => ({
 });
 
 const timeOptions = nodeModule("time");
+const scheduleOptions = nodeModule("schedule");
 const attachmentsOptions = nodeModule("attachments");
 const casesOptions = nodeModule("cases");
 const mediaOptions = nodeModule("media");
+const publisherOptions = nodeModule("publisher");
 
 /**
  * The browser-side modules that are worth testing on their own, emitted beside
@@ -90,9 +92,11 @@ const contexts = await Promise.all([
   esbuild.context(presets.esbuild.ui),
   esbuild.context(gateOptions),
   esbuild.context(timeOptions),
+  esbuild.context(scheduleOptions),
   esbuild.context(attachmentsOptions),
   esbuild.context(casesOptions),
   esbuild.context(mediaOptions),
+  esbuild.context(publisherOptions),
   esbuild.context(uploadOptions),
   esbuild.context(panelOptions),
 ]);
@@ -100,7 +104,7 @@ const contexts = await Promise.all([
 if (watch) {
   await Promise.all(contexts.map((c) => c.watch()));
   console.log(
-    "esbuild watch mode enabled for worker, manifest, ui, gate, time, attachments, cases, media, upload, panel",
+    "esbuild watch mode enabled for worker, manifest, ui, gate, time, schedule, attachments, cases, media, publisher, upload, panel",
   );
 } else {
   await Promise.all(contexts.map((c) => c.rebuild()));

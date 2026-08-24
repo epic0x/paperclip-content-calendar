@@ -11,10 +11,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  ALLOWED_VIDEO_TYPES,
   assetContentPath,
   assetRef,
+  mediaKindOf,
+  normalizeContentType,
   parseAssetRef,
   validateImageUpload,
+  validateMediaUpload,
 } from "../dist/attachments.js";
 
 test("a non-image file is rejected before any upload is attempted", () => {
@@ -51,6 +55,82 @@ test("a zero-byte file is rejected here, not by a 422 from the server", () => {
   );
   assert.equal(result.ok, false);
   assert.match(result.error, /empty/i);
+});
+
+// --- video --------------------------------------------------------------
+//
+// Paperclip's case attachment route accepts more video types than X will
+// reliably publish (webm and x-m4v among them), and it checks no content type
+// at all. The allowlist here is therefore narrower than the host's on purpose:
+// mp4 and quicktime are the two X ingests without surprises.
+
+test("an mp4 is an accepted upload for a post", () => {
+  const result = validateMediaUpload(
+    { name: "launch.mp4", type: "video/mp4", size: 4 * 1024 * 1024 },
+    { maxBytes: 10 * 1024 * 1024 },
+  );
+  assert.equal(result.ok, true);
+  assert.equal(result.error, null);
+});
+
+test("a quicktime .mov is accepted — it is what a phone and a screen recorder produce", () => {
+  const result = validateMediaUpload(
+    { name: "demo.mov", type: "video/quicktime", size: 1024 },
+    { maxBytes: 10 * 1024 * 1024 },
+  );
+  assert.equal(result.ok, true);
+});
+
+test("a video type Paperclip would store but X will not reliably take is rejected here", () => {
+  for (const type of ["video/webm", "video/x-m4v", "video/avi", "application/mp4"]) {
+    const result = validateMediaUpload(
+      { name: `clip.${type}`, type, size: 1024 },
+      { maxBytes: 10 * 1024 * 1024 },
+    );
+    assert.equal(result.ok, false, `${type} must not be accepted`);
+    assert.match(result.error, new RegExp(type.replace("/", "\\/")));
+  }
+  assert.deepEqual([...ALLOWED_VIDEO_TYPES], ["video/mp4", "video/quicktime"]);
+});
+
+test("a video over the company byte cap is rejected before any bytes move", () => {
+  const result = validateMediaUpload(
+    { name: "launch.mp4", type: "video/mp4", size: 11 * 1024 * 1024 },
+    { maxBytes: 10 * 1024 * 1024 },
+  );
+  assert.equal(result.ok, false);
+  assert.match(result.error, /10\.0 MB/);
+});
+
+test("an empty video is rejected here, not by a 422 from the server", () => {
+  const result = validateMediaUpload(
+    { name: "launch.mp4", type: "video/mp4", size: 0 },
+    { maxBytes: 10 * 1024 * 1024 },
+  );
+  assert.equal(result.ok, false);
+  assert.match(result.error, /empty/i);
+});
+
+test("the image-only check stays image-only, so nothing that used it now takes video", () => {
+  const result = validateImageUpload(
+    { name: "launch.mp4", type: "video/mp4", size: 1024 },
+    { maxBytes: 10 * 1024 * 1024 },
+  );
+  assert.equal(result.ok, false);
+  assert.match(result.error, /video\/mp4/);
+});
+
+test("a content type is classified by the same exact allowlist the upload uses", () => {
+  assert.equal(mediaKindOf("video/mp4"), "video");
+  assert.equal(mediaKindOf("VIDEO/QUICKTIME"), "video");
+  assert.equal(mediaKindOf(" image/png "), "image");
+  assert.equal(mediaKindOf("video/webm"), null);
+  assert.equal(mediaKindOf("image/svg+xml"), null);
+  assert.equal(mediaKindOf(""), null);
+  assert.equal(mediaKindOf(null), null);
+  // Not a prefix match: `video/` is the start of a real type, not a type.
+  assert.equal(mediaKindOf("video/mp4x"), null);
+  assert.equal(mediaKindOf("xvideo/mp4"), null);
 });
 
 // --- media_file as a native asset reference -------------------------------
@@ -138,4 +218,47 @@ test("a uuid mentioned in prose is not an asset reference", () => {
   const id = "8f14e45f-ceea-467a-9c1e-3a0a1b2c3d4e";
   assert.equal(parseAssetRef(`see asset:${id} for the image`), null);
   assert.equal(parseAssetRef(id), null, "a bare uuid is not a reference either");
+});
+
+// --- MIME parameters and case, normalised in ONE place ---------------------
+//
+// The content type that reaches these rules is whatever was recorded on the
+// asset row, and a `Content-Type` is `type/subtype` plus optional parameters:
+// `video/mp4; charset=binary` is what some uploaders and proxies send, and
+// curl's own `--data-binary` form of an upload is a common source of it. Every
+// consumer used to lowercase-and-trim its own copy of the string and then match
+// it exactly, so a parameter made the same file an unrenderable card, an
+// unpreviewable panel and a `.bin` temp file — three symptoms, one cause.
+
+test("a content type is normalised to its essence, once, for everyone", () => {
+  assert.equal(normalizeContentType("video/mp4"), "video/mp4");
+  assert.equal(normalizeContentType("  VIDEO/MP4  "), "video/mp4");
+  assert.equal(normalizeContentType("video/mp4; charset=binary"), "video/mp4");
+  assert.equal(normalizeContentType("image/JPEG;charset=binary"), "image/jpeg");
+  assert.equal(
+    normalizeContentType('image/png; name="a file.png"'),
+    "image/png",
+  );
+  assert.equal(normalizeContentType(""), "");
+  assert.equal(normalizeContentType(null), "");
+  assert.equal(normalizeContentType(undefined), "");
+  // A parameter is dropped; the type itself is never invented.
+  assert.equal(normalizeContentType("; charset=binary"), "");
+});
+
+test("a parameter on the content type does not change what the media IS", () => {
+  assert.equal(mediaKindOf("video/mp4; charset=binary"), "video");
+  assert.equal(mediaKindOf("VIDEO/MP4 ;charset=BINARY"), "video");
+  assert.equal(mediaKindOf("image/png; name=hero.png"), "image");
+  // Still not a prefix match, parameters or no parameters.
+  assert.equal(mediaKindOf("video/webm; charset=binary"), null);
+  assert.equal(mediaKindOf("video/mp4x; charset=binary"), null);
+});
+
+test("an upload check reads the same normalised type", () => {
+  const check = validateMediaUpload(
+    { name: "clip.mp4", type: "video/mp4; charset=binary", size: 1024 },
+    { maxBytes: 10 * 1024 * 1024 },
+  );
+  assert.equal(check.ok, true, check.error);
 });

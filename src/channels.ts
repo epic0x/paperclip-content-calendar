@@ -9,6 +9,7 @@
 import { createHmac, randomBytes } from "node:crypto";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import type { CalendarConfig, CalendarEntry } from "./cases.js";
+import { X_PUBLISH_TIMEOUT_MS, resolveXPublishScript } from "./publisher.js";
 
 export interface PublishRequest {
   entry: CalendarEntry;
@@ -113,9 +114,18 @@ function authHeaderFor(
  * a Paperclip-managed secret. Returns null when any part is missing, so
  * `isConfigured` can report a clean false rather than throwing mid-publish.
  */
-const X_PUBLISH_SCRIPT =
-  process.env.PAPERCLIP_X_PUBLISH_SCRIPT ??
-  "/home/openclaw/.hermes/scripts/x_publish.py";
+/**
+ * The publisher ships INSIDE the installed plugin, beside dist/.
+ *
+ * `paperclipai plugin install` copies the built artifact and nothing else, so
+ * the old default — a path under one machine's home directory — left the X
+ * channel reporting itself unconfigured on every other host. See
+ * ./publisher.ts; the env override is unchanged.
+ */
+const X_PUBLISH_SCRIPT = resolveXPublishScript(
+  import.meta.url,
+  process.env as Record<string, string | undefined>,
+);
 
 const MEDIA_DIR =
   process.env.PAPERCLIP_MEDIA_DIR ?? "/home/openclaw/social/out";
@@ -186,7 +196,9 @@ const xAdapter: ChannelAdapter = {
     return new Promise<PublishResult>((resolve) => {
       const child = spawn("python3", [X_PUBLISH_SCRIPT, payload], {
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: 180_000,
+        // Deliberately longer than the publisher's own 600 s bound, so the
+        // publisher is the one that reports a timeout. See publisher.ts.
+        timeout: X_PUBLISH_TIMEOUT_MS,
       });
 
       let out = "";

@@ -19,7 +19,7 @@
  * rule the adapter already applies to a missing file.
  */
 
-import { parseAssetRef } from "./attachments.js";
+import { normalizeContentType, parseAssetRef } from "./attachments.js";
 
 export interface AssetBytes {
   bytes: Uint8Array;
@@ -51,13 +51,23 @@ export interface ResolvedMedia {
 
 const noop = async () => {};
 
-/** Extension for a temp copy, from the asset's content type. */
+/**
+ * Extension for a temp copy, from the asset's content type.
+ *
+ * LOAD-BEARING for video. The publish script picks the simple image upload or
+ * X's chunked video upload from this extension, and X itself sniffs it too, so
+ * an mp4 written to `content-calendar-….bin` is a video that goes up the image
+ * path and is rejected. An unknown type still gets `.bin` — publishing bytes
+ * whose type we cannot name, under a name that claims a type, is worse.
+ */
 const EXTENSIONS: Record<string, string> = {
   "image/png": ".png",
   "image/jpeg": ".jpg",
   "image/jpg": ".jpg",
   "image/webp": ".webp",
   "image/gif": ".gif",
+  "video/mp4": ".mp4",
+  "video/quicktime": ".mov",
 };
 
 /**
@@ -83,14 +93,16 @@ function safeSegment(value: string, fallback: string): string {
  * file with nothing in the log to explain it.
  *
  * The extension still follows the content type: the publish script and X both
- * sniff on extension as well as bytes.
+ * sniff on extension as well as bytes. The lookup normalises first, so
+ * `video/mp4; charset=binary` — a real value to find on an asset row — is the
+ * mp4 it says it is and not an unnamed `.bin`.
  */
 export function tempFileNameFor(
   assetId: string,
   contentType: string,
   attemptId: string,
 ): string {
-  const ext = EXTENSIONS[(contentType ?? "").trim().toLowerCase()] ?? ".bin";
+  const ext = EXTENSIONS[normalizeContentType(contentType)] ?? ".bin";
   return `content-calendar-${safeSegment(assetId, "asset")}-${safeSegment(
     attemptId,
     "attempt",

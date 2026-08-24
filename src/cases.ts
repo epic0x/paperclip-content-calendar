@@ -12,13 +12,22 @@
  */
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { assetContentPath, assetRef, parseAssetRef } from "./attachments.js";
+import {
+  ALLOWED_MEDIA_TYPES,
+  assetContentPath,
+  assetRef,
+  mediaKindOf,
+  normalizeContentType,
+  parseAssetRef,
+  type MediaKind,
+} from "./attachments.js";
 import {
   CASE_TYPE,
   FIELD_ALT,
   FIELD_CAPTION,
   FIELD_CHANNEL,
   FIELD_MEDIA,
+  FIELD_MEDIA_TYPE,
   FIELD_PUBLISH_AT,
   FIELD_PUBLISH_URL,
 } from "./manifest.js";
@@ -61,6 +70,14 @@ export interface CalendarEntry {
   channel: string | null;
   caption: string | null;
   mediaFile: string | null;
+  /**
+   * Whether `media_file` is an image or a video — or null when there is no
+   * media, or its type is one this plugin will not render.
+   *
+   * The month grid has this and no attachment metadata whatsoever, which is
+   * the entire reason the case carries `media_type`: see FIELD_MEDIA_TYPE.
+   */
+  mediaType: MediaKind | null;
   publishUrl: string | null;
   /** Accessibility text for attached media. X requires alt on every image. */
   altText: string | null;
@@ -285,9 +302,30 @@ function str(v: unknown): string | null {
   return typeof v === "string" && v.trim().length > 0 ? v.trim() : null;
 }
 
+/**
+ * What kind of media a case is carrying, from the case row alone.
+ *
+ * ABSENT MEANS IMAGE. Every case written before `media_type` existed carries an
+ * image, so a missing field is an answer rather than a gap — reading it as
+ * "unknown" would blank the thumbnail on every post that already works.
+ *
+ * A type that IS recorded but is not one this plugin renders (a `video/webm`
+ * attached through Paperclip's own UI, say) is null rather than coerced: it
+ * would go into an <img>, show a broken image, and claim to be the post.
+ */
+export function entryMediaKind(
+  mediaFile: string | null,
+  mediaTypeField: unknown,
+): MediaKind | null {
+  if (!mediaFile) return null;
+  const recorded = str(mediaTypeField);
+  return recorded ? mediaKindOf(recorded) : "image";
+}
+
 /** Normalise a raw case into the shape the calendar renders. */
 export function toEntry(c: PaperclipCase): CalendarEntry {
   const fields = c.fields ?? {};
+  const mediaFile = str(fields[FIELD_MEDIA]);
   return {
     id: c.id,
     identifier: c.identifier,
@@ -297,7 +335,8 @@ export function toEntry(c: PaperclipCase): CalendarEntry {
     publishAt: str(fields[FIELD_PUBLISH_AT]),
     channel: str(fields[FIELD_CHANNEL]),
     caption: str(fields[FIELD_CAPTION]),
-    mediaFile: str(fields[FIELD_MEDIA]),
+    mediaFile,
+    mediaType: entryMediaKind(mediaFile, fields[FIELD_MEDIA_TYPE]),
     publishUrl: str(fields[FIELD_PUBLISH_URL]),
     altText: str(fields[FIELD_ALT]),
     // Approval is the NATIVE case status, never a JSON field. See
@@ -414,6 +453,38 @@ export function assertAttachedAsset(
 }
 
 /**
+ * Refuse an attachment this calendar cannot publish, BEFORE anything is written.
+ *
+ * Being attached to the case is not the same as being publishable. Paperclip's
+ * own attachment route checks no content type at all, and its allowlist is
+ * wider than ours (`video/webm`, `video/x-m4v`), so a webm dropped on the case
+ * through Paperclip's UI is a perfectly real attachment that `set-media` used
+ * to accept and record. What that produced was a post that looks attached and
+ * is not: `cardMedia` renders nothing for it, `selectedMedia` previews nothing
+ * for it, and x_publish.py refuses the extension at publish time — which is the
+ * one moment nobody is watching.
+ *
+ * So the refusal happens here, while the operator is still standing in front of
+ * the panel, and it names what was refused and what is accepted. Returns the
+ * kind, so the caller does not classify the same string twice.
+ */
+export function assertPublishableMedia(
+  attachment: AttachmentSummary,
+  identifier: string,
+): MediaKind {
+  const kind = mediaKindOf(attachment.contentType);
+  if (!kind) {
+    const type = normalizeContentType(attachment.contentType) || "no content type";
+    throw new Error(
+      `asset ${attachment.assetId} on ${identifier} is ${type}, which this ` +
+        `calendar cannot publish. Accepted: ${ALLOWED_MEDIA_TYPES.join(", ")}. ` +
+        `Nothing was changed.`,
+    );
+  }
+  return kind;
+}
+
+/**
  * The server-side line for a `set-media` that did not go through.
  *
  * The browser is handed the thrown message and nothing else, and the panel is
@@ -471,22 +542,167 @@ export function buildContentPatch(edit: ContentEdit): Record<string, unknown> {
 }
 
 /**
- * The patch that makes a freshly uploaded asset the case's image.
+ * The patch that makes a freshly uploaded asset the case's media.
  *
  * Written only AFTER the upload and the case_attachments link both succeeded,
- * so a failed replacement leaves the previous image in place.
+ * so a failed replacement leaves the previous media in place.
+ *
+ * `media_file` and `media_type` are always written TOGETHER. Splitting them
+ * across two writes allows the second to fail and leave a video pointed at by
+ * a case that still claims to be an image — which renders as a broken <img> in
+ * the calendar and takes the wrong X upload path at publish time. The type is
+ * the one the caller VERIFIED on the attached asset, not the browser's guess
+ * about the file it picked.
  */
 export function buildMediaPatch(input: {
   assetId: string;
+  /** Content type of the verified attachment, e.g. `image/png`, `video/mp4`. */
+  contentType: string;
   altText?: string | null;
 }): Record<string, unknown> {
   const patch: Record<string, unknown> = {
     [FIELD_MEDIA]: assetRef(input.assetId),
+    // Normalised, because `media_type` is read back by exact match — by the
+    // month grid's projection and by the publish path. Persisting the raw
+    // `video/mp4; charset=binary` writes a value neither of them recognises.
+    [FIELD_MEDIA_TYPE]: normalizeContentType(input.contentType),
   };
   if (input.altText !== undefined) {
     patch[FIELD_ALT] = trimmedOrNull(input.altText);
   }
   return patch;
+}
+
+// ---------------------------------------------------------------------------
+// Creating a post from the calendar
+// ---------------------------------------------------------------------------
+
+/**
+ * The payload for `POST /api/companies/:companyId/cases`.
+ *
+ * Mirrors the server's `createCaseSchema`, which is `.strict()` — an unknown
+ * key is a 400, not a field the server shrugs off. Only the members this
+ * calendar actually sets are modelled.
+ */
+export interface CreateCasePayload {
+  caseType: string;
+  key: string;
+  title: string;
+  status: CaseStatus;
+  fields: Record<string, unknown>;
+}
+
+/**
+ * A key that belongs to exactly one created post.
+ *
+ * NOT cosmetic, and not optional — see `buildCreatePayload`.
+ * `caseKeySchema` on the server is
+ * `z.string().trim().min(1).max(512)`, and the document key route restricts the
+ * character set to `[A-Za-z0-9_.:-]`, so this stays inside both.
+ */
+export function newCaseKey(): string {
+  const uuid =
+    typeof globalThis.crypto?.randomUUID === "function"
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`;
+  return `calendar-${uuid}`;
+}
+
+/**
+ * Build the create payload for a post authored in the calendar.
+ *
+ * WHY THE KEY IS MANDATORY. `POST /companies/:companyId/cases` is an UPSERT on
+ * `(companyId, caseType, key)`, and the server builds its match as
+ *
+ *     const keyFilter = body.key ? eq(cases.key, body.key) : isNull(cases.key);
+ *
+ * so a create sent WITHOUT a key matches the first existing keyless
+ * `social_post` case and updates it in place — replacing its title, its status
+ * and its entire `fields` object, then answering 200 as though all was well.
+ * "Create" with no key is a destructive write against a post nobody was
+ * looking at. A key of its own makes the request create, and makes a retry of
+ * the same submission converge on the same case instead of a duplicate.
+ *
+ * WHAT IS DELIBERATELY ABSENT. A post created here is a `draft` carrying a
+ * title, an optional caption and a date. No `channel`, no `publish_url`, and
+ * `approved` is the NATIVE status, which is `draft`. That is not tidiness: the
+ * publish gate needs approval AND a channel AND a caption, so a post created
+ * here cannot be sent by the sweep or by Post Now until a human opens it and
+ * fills the rest in. Scheduling something is not approving it.
+ */
+export function buildCreatePayload(input: {
+  title: string;
+  caption?: string | null;
+  /** UTC instant, on a Dubai :00/:30 slot. */
+  publishAt: string;
+  /** Required. See above — a keyless create is an update. */
+  key: string | null | undefined;
+}): CreateCasePayload {
+  const title = (input.title ?? "").trim();
+  if (!title) throw new Error("a title is required to create a post");
+
+  const key = (input.key ?? "").trim();
+  if (!key) {
+    throw new Error(
+      "a case key is required: POST /cases upserts on (caseType, key) and a keyless create would UPDATE an existing keyless case",
+    );
+  }
+
+  const publishAt = (input.publishAt ?? "").trim();
+  if (!publishAt || Number.isNaN(Date.parse(publishAt))) {
+    throw new Error(`publishAt is not a valid instant: ${String(input.publishAt)}`);
+  }
+  // The same rule every other write obeys, so a created post lands on a slot
+  // the twice-hourly publish job actually visits.
+  const minutes = new Date(publishAt).getUTCMinutes();
+  if (minutes !== 0 && minutes !== 30) {
+    throw new Error("publishAt must be on a Dubai :00 or :30 time slot");
+  }
+
+  const fields: Record<string, unknown> = { publish_at: publishAt };
+  const caption = (input.caption ?? "").trim();
+  // An empty caption is absent, not "". `toEntry` reads both back as null, but
+  // the gate's "no caption" refusal and a hand-read of the case are clearer
+  // when the key simply is not there.
+  if (caption) fields[FIELD_CAPTION] = caption;
+
+  return { caseType: CASE_TYPE, key, title, status: "draft", fields };
+}
+
+/**
+ * Create one social_post case over the authenticated API.
+ *
+ * `created` distinguishes the route's 201 (a new case) from its 200 (it matched
+ * an existing `(caseType, key)` and updated it). The caller reports the
+ * difference rather than assuming, because a "create" that silently updated is
+ * exactly what the key is there to prevent.
+ */
+export async function createSocialCase(
+  ctx: PluginContext,
+  cfg: CalendarConfig,
+  payload: CreateCasePayload,
+  companyId: string,
+): Promise<{ created: boolean; entry: CalendarEntry; raw: PaperclipCase }> {
+  const url = `${cfg.apiBaseUrl}/api/companies/${companyId}/cases`;
+  const res = await fetchFor(ctx, url)(url, {
+    method: "POST",
+    headers: {
+      Authorization: await authHeader(ctx, cfg, companyId),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new CasesApiError(
+      `POST /api/companies/${companyId}/cases -> ${res.status}`,
+      res.status,
+      text.slice(0, 500),
+    );
+  }
+  const parsed = JSON.parse(text) as PaperclipCase | { case: PaperclipCase };
+  const row = "case" in parsed ? parsed.case : parsed;
+  return { created: res.status === 201, entry: toEntry(row), raw: row };
 }
 
 /**

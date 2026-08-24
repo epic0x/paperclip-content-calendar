@@ -159,3 +159,54 @@ test("a temp name is always a single file name, never a path", () => {
     assert.match(name, /^content-calendar-/);
   }
 });
+
+// --- video -----------------------------------------------------------------
+//
+// The publish script and X both sniff on the EXTENSION as well as the bytes,
+// and the chunked upload path is chosen from it. A video written to a `.bin`
+// temp file is a video X refuses.
+
+test("an mp4 asset is materialised as an .mp4, not a .bin", async () => {
+  const state = deps();
+  await resolveMediaForPublish(
+    `asset:${ASSET_ID}`,
+    makeDeps(state, { contentType: "video/mp4" }),
+  );
+  assert.match(state.written[0].name, /\.mp4$/);
+});
+
+test("a quicktime asset is materialised as a .mov", async () => {
+  const state = deps();
+  await resolveMediaForPublish(
+    `asset:${ASSET_ID}`,
+    makeDeps(state, { contentType: "video/quicktime" }),
+  );
+  assert.match(state.written[0].name, /\.mov$/);
+});
+
+test("the video temp name is still one attempt-scoped file name, never a path", () => {
+  const a = tempFileNameFor(ASSET_ID, "video/mp4", "attempt-1");
+  const b = tempFileNameFor(ASSET_ID, "video/mp4", "attempt-2");
+  assert.notEqual(a, b, "a sweep and a Post Now must not delete each other's copy");
+  assert.match(a, /\.mp4$/);
+  assert.match(tempFileNameFor(ASSET_ID, "VIDEO/QUICKTIME", "x"), /\.mov$/);
+  for (const name of [
+    tempFileNameFor("../../etc/passwd", "video/mp4", "x"),
+    tempFileNameFor(ASSET_ID, "video/mp4", "../../evil"),
+  ]) {
+    assert.ok(!name.includes("/"), `${name} must not contain a separator`);
+    assert.ok(!name.includes(".."), `${name} must not contain ..`);
+  }
+});
+
+test("a content type carrying parameters still picks the right extension", () => {
+  // `video/mp4; charset=binary` is a real thing to find on an asset row, and
+  // it used to fall off the end of the extension table into `.bin` — which
+  // sends an mp4 up X's IMAGE path, where it is rejected. The extension is
+  // load-bearing, so the lookup normalises exactly like everything else does.
+  assert.match(tempFileNameFor(ASSET_ID, "video/mp4; charset=binary", "x"), /\.mp4$/);
+  assert.match(tempFileNameFor(ASSET_ID, "VIDEO/MP4 ;charset=binary", "x"), /\.mp4$/);
+  assert.match(tempFileNameFor(ASSET_ID, "image/png; name=hero.png", "x"), /\.png$/);
+  // An unknown type is still .bin: naming bytes we cannot name is worse.
+  assert.match(tempFileNameFor(ASSET_ID, "video/webm; charset=binary", "x"), /\.bin$/);
+});

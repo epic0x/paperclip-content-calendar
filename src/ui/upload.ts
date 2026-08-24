@@ -26,21 +26,32 @@
  */
 
 import {
+  ALLOWED_IMAGE_TYPES,
+  ALLOWED_MEDIA_TYPES,
   assetContentPath,
-  validateImageUpload,
+  validateMediaUpload,
   type UploadCandidate,
 } from "../attachments.js";
 
-export interface UploadedImage {
+export interface UploadedMedia {
   /** case_attachments row id. */
   attachmentId: string;
   /** assets row id — what `media_file` will point at. */
   assetId: string;
   contentPath: string;
+  /**
+   * What Paperclip stored the bytes AS.
+   *
+   * The server's answer, not the browser's guess, and the only thing that
+   * decides whether this post carries an image or a video from here on.
+   */
   contentType: string;
   byteSize: number;
   originalFilename: string | null;
 }
+
+/** @deprecated Use {@link UploadedMedia}; kept so older imports keep compiling. */
+export type UploadedImage = UploadedMedia;
 
 export interface UploadInput {
   /** Case id or identifier; the route accepts either. */
@@ -48,6 +59,8 @@ export interface UploadInput {
   file: File;
   /** Effective company limit, read from the worker's detail handler. */
   maxBytes: number;
+  /** Narrows what may be sent. Defaults to every type a post may carry. */
+  allowedTypes?: readonly string[];
   /** Injectable for tests. Defaults to the page's fetch. */
   fetchImpl?: typeof fetch;
 }
@@ -75,18 +88,23 @@ async function failureMessage(res: Response): Promise<string> {
 }
 
 /**
- * Attach an image to a social_post case.
+ * Attach an image or a video to a social_post case.
  *
- * Creates the asset AND the case_attachments link in one native call. Nothing
- * about the case changes here, so a failure leaves the previous image attached.
+ * Creates the asset AND the case_attachments link in one native call. ONE path
+ * for both kinds: the route stores bytes and records a content type, and it has
+ * no idea what a social post is. Nothing about the case changes here, so a
+ * failure leaves the previous media attached and referenced.
  */
-export async function uploadCaseImage(input: UploadInput): Promise<UploadedImage> {
+export async function uploadCaseMedia(input: UploadInput): Promise<UploadedMedia> {
   const candidate: UploadCandidate = {
     name: input.file.name,
     type: input.file.type,
     size: input.file.size,
   };
-  const check = validateImageUpload(candidate, { maxBytes: input.maxBytes });
+  const check = validateMediaUpload(candidate, {
+    maxBytes: input.maxBytes,
+    allowed: input.allowedTypes ?? ALLOWED_MEDIA_TYPES,
+  });
   if (!check.ok) throw new UploadError(check.error, null);
 
   const form = new FormData();
@@ -120,7 +138,7 @@ export async function uploadCaseImage(input: UploadInput): Promise<UploadedImage
   const assetId = body.asset?.id ?? body.assetId;
   if (!assetId) {
     throw new UploadError(
-      "Paperclip accepted the upload but returned no asset id, so the image was not attached to the case.",
+      "Paperclip accepted the upload but returned no asset id, so the file was not attached to the case.",
       res.status,
     );
   }
@@ -133,4 +151,14 @@ export async function uploadCaseImage(input: UploadInput): Promise<UploadedImage
     byteSize: body.asset?.byteSize ?? input.file.size,
     originalFilename: body.asset?.originalFilename ?? input.file.name ?? null,
   };
+}
+
+/**
+ * Attach an IMAGE, refusing anything else.
+ *
+ * The narrower door, kept for callers that mean images specifically. The panel
+ * uses `uploadCaseMedia`.
+ */
+export function uploadCaseImage(input: UploadInput): Promise<UploadedMedia> {
+  return uploadCaseMedia({ ...input, allowedTypes: ALLOWED_IMAGE_TYPES });
 }

@@ -19,10 +19,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  SELECTED_VIDEO_PLAYBACK,
   actionFailure,
   actionSuccess,
   publishMessage,
   reconcileSelection,
+  selectedMedia,
   statusMessage,
 } from "../dist/ui/panel.js";
 
@@ -131,4 +133,126 @@ test("a success is routed the same way, so one action cannot clear another's err
   assert.equal(statusMessage(posted), null);
   assert.equal(statusMessage(null), null);
   assert.equal(publishMessage(null), null);
+});
+
+// ---------------------------------------------------------------------------
+// What the OPEN panel previews
+// ---------------------------------------------------------------------------
+//
+// The grid decides from the case field, because that is all it has. The panel
+// has the attachment itself, and the attachment's content type is Paperclip's
+// own record of what it stored — so that is what the preview follows. When the
+// two disagree, the field is the one that can be stale or hand-edited; the
+// asset is the bytes that will actually be published.
+
+const ASSET = "0b6c3f2a-9d41-4c7e-8b52-1f6a8e0d4c33";
+
+const attachment = (over = {}) => ({
+  id: "attachment-1",
+  assetId: ASSET,
+  contentPath: `/api/assets/${ASSET}/content`,
+  contentType: "image/png",
+  byteSize: 2048,
+  originalFilename: "hero.png",
+  createdAt: "2026-08-24T09:00:00.000Z",
+  ...over,
+});
+
+const detail = (over = {}) => ({
+  id: "case-1",
+  identifier: "PAP-C1",
+  title: "A post",
+  mediaFile: `asset:${ASSET}`,
+  mediaType: "image",
+  altText: null,
+  attachments: [attachment()],
+  activeAttachment: attachment(),
+  unreferencedAttachments: [],
+  legacyMediaFile: false,
+  ...over,
+});
+
+test("the attachment's own content type decides the preview, not the case field", () => {
+  const media = selectedMedia(
+    detail({
+      // media_type says image, the asset Paperclip stored is a video. This is
+      // exactly the state a hand-edited case, or a set-media that failed
+      // between the two writes, leaves behind.
+      mediaType: "image",
+      activeAttachment: attachment({
+        contentType: "video/mp4",
+        originalFilename: "demo.mp4",
+      }),
+    }),
+  );
+  assert.equal(media.kind, "video");
+  assert.equal(media.src, `/api/assets/${ASSET}/content`);
+});
+
+test("and the other way round: a stale video field over image bytes previews the image", () => {
+  const media = selectedMedia(detail({ mediaType: "video" }));
+  assert.equal(media.kind, "image");
+});
+
+test("a selected video gets real playback controls", () => {
+  const media = selectedMedia(
+    detail({ activeAttachment: attachment({ contentType: "video/quicktime" }) }),
+  );
+  assert.equal(media.kind, "video");
+  assert.equal(media.playback.controls, true, "the operator has to be able to watch it");
+  assert.equal(media.playback.autoPlay, false, "nothing plays because a panel opened");
+  assert.equal(media.playback.muted, false, "pressing play means hearing it");
+  assert.deepEqual(media.playback, SELECTED_VIDEO_PLAYBACK);
+});
+
+test("even the panel's video fetches only its header until asked", () => {
+  // A month of posts must never cost a month of video. Cards mount no <video>
+  // at all (see calendar-video-mount.test.mjs); the panel mounts one, and even
+  // that one loads its header rather than the file until the operator plays it.
+  assert.equal(SELECTED_VIDEO_PLAYBACK.preload, "metadata", "bytes only on demand");
+});
+
+test("an image preview carries no playback policy at all", () => {
+  const media = selectedMedia(detail());
+  assert.equal(media.kind, "image");
+  assert.equal(media.playback, null);
+});
+
+test("the preview names itself with the case's alt text, then the filename", () => {
+  assert.equal(
+    selectedMedia(detail({ altText: "A 20s product demo" })).alt,
+    "A 20s product demo",
+  );
+  assert.equal(selectedMedia(detail()).alt, "hero.png");
+  assert.match(
+    selectedMedia(
+      detail({ activeAttachment: attachment({ originalFilename: null }) }),
+    ).alt,
+    /\S/,
+  );
+});
+
+test("nothing is previewed when nothing is the post's media", () => {
+  assert.equal(selectedMedia(detail({ activeAttachment: null })), null);
+  assert.equal(selectedMedia(null), null);
+  assert.equal(selectedMedia(undefined), null);
+});
+
+test("an attachment of a type this plugin cannot render previews nothing", () => {
+  // Attachable through Paperclip's own UI, not through this panel. An <img>
+  // pointed at a webm shows a broken image and claims it is the post.
+  assert.equal(
+    selectedMedia(
+      detail({ activeAttachment: attachment({ contentType: "video/webm" }) }),
+    ),
+    null,
+  );
+  assert.equal(
+    selectedMedia(
+      detail({
+        activeAttachment: attachment({ contentType: "application/octet-stream" }),
+      }),
+    ),
+    null,
+  );
 });
